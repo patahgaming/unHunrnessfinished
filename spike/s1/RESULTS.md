@@ -78,3 +78,8 @@ pwsh spike/s1/probe-accel.ps1
 ```
 
 The script writes a fresh `results/accel-<utc>.json` and never needs a guest image.
+
+**Phase 0 addition (2026-11-18):** the accelerator evidence here was combined with a probe-guest
+boot measurement (Alpine 3.24.4) in `spike/s1/RESULTS-phase0.md`. That file adds a measured boot
+time for a **probe guest only**; it does not change the verdict here and does not close the NixOS
+half of S1.
