@@ -140,8 +140,8 @@ Design notes worth stating explicitly, because they are easy to get wrong:
 - **Sync is inside the loop, not around it.** The step's commit and merge happen before the
   next expert call, so a conflict stops the run at the step that caused it rather than after
   ten more steps were built on a stale file (`D-022`).
-- **`blocked` is a third terminal state.** `ok`, `failed`, and `budget` end a run; `blocked`
-  parks it until the lead resolves a conflict, and `--continue` resumes at the next step.
+- **`blocked` is not an ending.** `ok`, `failed`, and `budget` finish a run; `blocked` parks it
+  until the lead resolves a conflict, and `--continue` resumes at the next step.
 - **`route()` respects the default.** With routing disabled (`D-007`), it returns the lead's
   `--expert` or prompts with the candidate list; it never guesses.
 
