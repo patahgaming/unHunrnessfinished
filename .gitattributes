@@ -1,0 +1,9 @@
+# Bothea v2 — repository hygiene
+# Required by docs/sync.md §6 and asserted by `bothea sync doctor`.
+#
+# `-text` disables every end-of-line conversion in both directions, so a file
+# written in the NixOS guest is byte-identical when read on the Windows host.
+# Do not change this line; prototype under S2 proved that CRLF/LF translation
+# turns a 200-file round trip into 200 phantom conflicts.
+
+* -text
