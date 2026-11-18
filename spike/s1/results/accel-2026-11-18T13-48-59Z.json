@@ -1,0 +1,48 @@
+{
+  "timestamp_utc": "2026-11-18T13-48-59Z",
+  "host": {
+    "computer": "NANAS",
+    "os_build": "26200",
+    "hypervisor_present": true,
+    "winhvplatform_dll": true,
+    "qemu_exe": "D:\\projects\\BotheaV2\\.tools\\qemu\\qemu-system-x86_64.exe",
+    "qemu_version": "QEMU emulator version 11.1.0 (v11.1.0-12130-ge470268ff4)",
+    "qemu_sha256": "47d57a6072e0bb3bd98f87926eb129eb1736dfe818c67b3b81ef7ce4edd0b3cd",
+    "hold_seconds": 5
+  },
+  "probes": [
+    {
+      "name": "whpx-recorded",
+      "argv": "-machine q35 -accel whpx,kernel-irqchip=off -nodefaults -display none -serial none",
+      "held_seconds": 5,
+      "still_running": true,
+      "exit_code": null,
+      "state": "initialized",
+      "stderr_head": "D:\\projects\\BotheaV2\\.tools\\qemu\\qemu-system-x86_64.exe: warning: host doesn't support requested feature: CPUID[eax=80000001h].ECX.svm [bit 2]",
+      "stderr_file": "probe-whpx-recorded-2026-11-18T13-48-59Z.stderr.log"
+    },
+    {
+      "name": "whpx-plain",
+      "argv": "-machine q35 -accel whpx -nodefaults -display none -serial none",
+      "held_seconds": 5,
+      "still_running": true,
+      "exit_code": null,
+      "state": "initialized",
+      "stderr_head": [
+        "D:\\projects\\BotheaV2\\.tools\\qemu\\qemu-system-x86_64.exe: warning: host doesn't support requested feature: CPUID[eax=80000001h].ECX.svm [bit 2]",
+        "D:\\projects\\BotheaV2\\.tools\\qemu\\qemu-system-x86_64.exe: warning: Ignoring request for interrupt vector 0"
+      ],
+      "stderr_file": "probe-whpx-plain-2026-11-18T13-48-59Z.stderr.log"
+    },
+    {
+      "name": "tcg-control",
+      "argv": "-machine q35 -accel tcg -nodefaults -display none -serial none",
+      "held_seconds": 5,
+      "still_running": true,
+      "exit_code": null,
+      "state": "initialized",
+      "stderr_head": null,
+      "stderr_file": "probe-tcg-control-2026-11-18T13-48-59Z.stderr.log"
+    }
+  ]
+}
