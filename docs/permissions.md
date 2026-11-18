@@ -16,8 +16,12 @@ Two layers, and the stricter one wins.
   effective policy          =   stricter of the two
 ```
 
-Action types: **`read`, `write`, `delete`, `network`, `shell`**. Policy values:
-**`allow`, `ask`, `deny`**. One vocabulary everywhere — config, manifest, prompt, log.
+Action types: **`read`, `create`, `modify`, `delete`, `network`, `shell`** (`D-034`). Policy
+values: **`allow`, `ask`, `deny`**. One vocabulary everywhere — config, manifest, prompt, log.
+
+`create` and `modify` are the two halves of what used to be `write`: a path that does not exist
+yet is `create`, a path that already exists is `modify`. The `delete` ceiling is path-based —
+`allow` inside the workspace, `deny` outside it, after symlink resolution.
 
 Two rules are not declarable, not configurable, and not part of the vocabulary above:
 
@@ -35,8 +39,9 @@ A plugin states its own policy, per action type:
 ```toml
 [permissions]
 read    = "allow"
-write   = "allow"
-delete  = "allow"
+create  = "allow"
+modify  = "ask"
+delete  = "ask"
 shell   = "ask"
 network = "ask"
 ```
@@ -53,11 +58,23 @@ in a manifest would otherwise bypass the host's allowlist. So:
 | Action type | Host ceiling (default) | May a manifest loosen it? |
 |---|---|---|
 | `read` | `allow` | no |
-| `write` | `allow` | no |
-| `delete` | `allow` | no |
+| `create` | `allow` | no |
+| `modify` | `allow` | no |
+| `delete` | `allow` inside the workspace, `deny` outside (path-based, after symlink resolution) | no |
 | `shell` | `allow` | no |
 | `network` | `ask` (non-allowlisted) / `allow` (allowlisted) | **no** |
 | `write_outside_workspace` | `deny` | never exists as a key |
+
+A path that is outside the workspace is denied for `create`, `modify` and `delete` before any
+declaration is consulted, so the path-based row above can express "delete is allowed here" but
+never "delete is allowed anywhere else".
+
+**What the six types cannot express, stated because it is easy to assume otherwise:** `shell`
+is one type, so "a risky command needs permission" is not encodable per command. A tool that
+wants that behaviour declares `shell = "ask"` and says so in its manifest; the host cannot tell
+`ls` from `rm -rf` at the type level. Answer 3's rule for shell commands is therefore enforced
+by declaration or not at all, and a command-level classification could only live inside the
+tool, where the host cannot verify it.
 
 The host can therefore **tighten** globally (`permissions.shell = "ask"` makes every plugin
 ask, even one that declared `allow`) and can never be **loosened** by a manifest.
@@ -73,9 +90,12 @@ evaluate(call):
   1. if call is a merge-conflict resolution:      ASK (unconditional, D-020)
   2. type   = call.action_type                    # from the manifest's declared set
   3. if type is absent from manifest.permissions: DENY  (fail-closed)
-  4. if call.target outside workspace:            DENY  (after symlink resolution)
+  4. if type in {create, modify, delete} and call.target outside workspace:
+                                                  DENY  (after symlink resolution)
   5. declared = manifest.permissions[type]
   6. ceiling  = host.ceiling[type]
+       if type == delete and target inside workspace:
+           ceiling = allow                        # path-based, D-034
        if type == network and host_of(call.target) in egress.allow:
            ceiling = max(ceiling, allow)          # allowlisted hosts, still capped for the rest
   7. policy   = stricter(declared, ceiling)
@@ -91,8 +111,10 @@ model gets a chance to do something else.
 
 ## 4. Fixed rules carried over
 
-- **Deletion inside the workspace is allowed and auto-merges.** Deleting a file is a normal
-  edit; the snapshot precedes every merge, so it is reversible. Prompting on delete is
+- **Deletion inside the workspace is not blocked at the ceiling, and it auto-merges.** The
+  `delete` ceiling is `allow` inside the workspace (`D-034`); a plugin may still declare `ask`,
+  and a one-sided deletion merges without a prompt (`FR-S4`). Deleting a file is a normal edit,
+  and the snapshot precedes every merge, so it is reversible. Prompting on every delete is
   prompting on the second most common file operation in the world, which trains the lead to
   press yes without reading.
 - **Keys and network policy are enforced by the host**, never by the AI and never by a manifest.
@@ -123,11 +145,16 @@ boundary. It should not be, and it is not Bothea's application to begin with.
 
 **Names, not addresses** (`D-028`). The guest never dials a provider, because it has no
 credential for one and the proxy carries none. Two kinds of allowlist entry exist: direct hosts
-the guest genuinely uses (`cache.nixos.org`, `channels.nixos.org`) and
-`nine_router.proxy_host` — a synthetic name the proxy maps to `nine_router.base_url`. Provider
-hostnames are rejected at config validation, not merely unused: listing one would describe a
-path that cannot work and would make the topology look like the proxy talks to providers
-directly.
+the guest genuinely uses, and `nine_router.proxy_host` — a synthetic name the proxy maps to
+`nine_router.base_url`. **The host list is open (`D-049`): the lead has not supplied it, and no
+entry in docs or config is ratified.** Provider hostnames are rejected at config validation, not
+merely unused: listing one would describe a path that cannot work and would make the topology
+look like the proxy talks to providers directly.
+
+**NullClaw is not on this path** (`D-045`). Channel traffic terminates on the host in NullClaw,
+which calls Bothea as a local process; it never enters the guest and never traverses the proxy,
+so the allowlist above is unchanged by the gateway. NullClaw's own outbound traffic is its own
+configuration, not Bothea's policy.
 
 From inside the guest the proxy is `10.0.2.2:<proxy_port>`, because QEMU user-mode networking
 maps host loopback to that address; the host-side bind is still `127.0.0.1`. The mapping is a
@@ -179,6 +206,13 @@ The list to test against:
 
 Item 10 is why the guest's own firewall rules are labelled defence in depth: the AI *can* edit
 them, and it gains nothing.
+
+**Outside this engine entirely (`D-045`).** NullClaw's own tools execute on the host with the
+lead's privileges and are **not** evaluated here. That is a deliberate boundary, not an
+oversight: the gateway is an application the lead runs and hardens, and this engine governs
+tools a Bothea run calls, not what the gateway does with its own channels. The accepted risk and
+its mitigations — pairing, per-channel allowlists, `workspace_only`, supervised autonomy,
+sandbox, audit — are recorded in `D-045`.
 
 ## 7. Prompts
 

@@ -55,7 +55,8 @@ Properties that matter:
   pruning content, not by pruning refs (§7).
 
 **Before every merge**, the core takes a snapshot and logs `snapshot.create` with the ref.
-**Before `vm reset`, before `--restore`, and before the first sync of a session**, likewise.
+**Before `--restore` and before the first sync of a session**, likewise. There is no `vm reset`
+to take one for (`D-041`).
 
 With per-step sync (`D-022`) that means up to one snapshot per step. That is intentional and
 cheap: snapshot trees share blobs with everything already in the object store, so twenty steps
@@ -75,28 +76,35 @@ snapshot of the current state. Restore is never destructive without a snapshot f
 ## 3. Transport
 
 No git server, no shared folder, no guest-initiated connection. Data moves as **bundles over
-the control channel** (`D-003`).
+the control channel**: the QEMU guest agent's file primitives (`D-040`), because the old
+`bothea-broker` stream is gone.
 
 **Host → guest** (before the expert works):
 
 ```text
-core:    git bundle create - --branches  >  stream
-         broker.put("/tmp/bothea/in.bundle", stream)
-guest:   git -C ~/work fetch /tmp/bothea/in.bundle 'refs/heads/*:refs/remotes/bothea/*'
-         git -C ~/work checkout -B agent/<run> refs/remotes/bothea/main
+core:    git bundle create /tmp/bothea/in.bundle --branches
+         guest-file-open("/tmp/bothea/in.bundle", write) -> chunked guest-file-write
+guest:   guest-exec: git -C ~/work fetch /tmp/bothea/in.bundle 'refs/heads/*:refs/remotes/bothea/*'
+         guest-exec: git -C ~/work checkout -B agent/<run> refs/remotes/bothea/main
 ```
 
 **Guest → host** (at each step commit and at end of run):
 
 ```text
-guest:   git -C ~/work bundle create /tmp/bothea/out.bundle agent/<run>
-core:    stream <- broker.get("/tmp/bothea/out.bundle")
+guest:   guest-exec: git -C ~/work bundle create /tmp/bothea/out.bundle agent/<run>
+core:    guest-file-open("/tmp/bothea/out.bundle", read) -> chunked guest-file-read into a local file
          git fetch <stream-file> 'refs/heads/agent/<run>:refs/heads/agent/<run>'
          git merge --no-ff agent/<run>
 ```
 
-Bundles are cheap for text workspaces and are atomic by nature: a partial transfer is a
-broken bundle, which git rejects. That is a better failure mode than a half-applied rsync.
+The transfer is chunked and size-capped (`FR-T2`, `D-040`): a bundle larger than the cap is a
+refusal that names the size, not a truncated fetch. The **M2 exit criterion measures one bundle
+transfer at the largest realistic workspace size** and records the number, because `D-040`
+replaced the multiplexer without a spike and this is the proof that the replacement carries the
+job.
+
+Bundles are cheap for text workspaces and are atomic by nature: a partial transfer is a broken
+bundle, which git rejects. That is a better failure mode than a half-applied rsync.
 
 ## 4. When sync runs, and how the merge behaves
 

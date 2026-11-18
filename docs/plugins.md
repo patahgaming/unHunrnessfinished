@@ -25,7 +25,8 @@ license = "MIT"
 
 [permissions]                    # declared policy per action type; absent = deny
 read    = "allow"
-write   = "allow"
+create  = "allow"
+modify  = "allow"
 delete  = "allow"
 shell   = "ask"
 network = "ask"
@@ -38,6 +39,11 @@ attrs = ["ripgrep"]
 [invoke]
 entry = "rg"                     # binary name inside the guest
 args_schema = "args.json"        # JSON Schema for the model-facing arguments
+
+[[tool_groups]]                  # optional: grouped definitions, detail on request (D-048)
+name    = "text-search"
+summary = "Find text in files and read the matches"
+tools   = ["search", "fs.read"]
 ```
 
 `[permissions]` is part of the plugin's identity: changing it changes the manifest hash, which
@@ -77,9 +83,10 @@ process Bothea does not start (`D-021`). `ctx` stays because it is a claim the c
 
 - `type` decides which sections are legal. A `tool` with a `[backend]` is rejected; an
   `expert` with `[install]` or `[permissions]` is rejected.
-- `[permissions]` accepts only the five action types (`read`, `write`, `delete`, `network`,
-  `shell`) and only the three values (`allow`, `ask`, `deny`). Anything else is an error, not a
-  warning.
+- `[permissions]` accepts only the six action types (`read`, `create`, `modify`, `delete`,
+  `network`, `shell`) and only the three values (`allow`, `ask`, `deny`). Anything else is an
+  error, not a warning. `write` is not a valid key: it is split into `create` and `modify`
+  (`D-034`).
 - `write_outside_workspace` is not a valid key. Outside-workspace writes are always denied
   (`docs/permissions.md` §1).
 - A declared `allow` above the host ceiling is accepted and silently capped, and the cap is
@@ -90,6 +97,12 @@ process Bothea does not start (`D-021`). `ctx` stays because it is a claim the c
 - `sha256` for a GGUF is required. A model without a hash is not pinnable and not loadable.
 - Unknown keys are a validation error, not a warning. Silent typos in a permission table are
   how guardrails get disabled.
+- `[[tool_groups]]` entries must name tools the manifest actually exposes and carry a one-line
+  summary. A group is a **context optimisation, never a permission boundary**: the permission of
+  a call is still the tool's declared type, checked by the engine (`D-048`). With
+  `tools.lazy_detail = true` (the default) the expert sees only group summaries and calls the
+  built-in `tools.describe` to get a group's full schemas; that call is logged as
+  `tool.describe` and counts toward `max_tool_calls`.
 
 ## 2. Install model
 
@@ -98,12 +111,16 @@ The host stores manifests. The guest stores programs.
 ```text
 bothea tools install ripgrep
   1. resolve nixpkgs revision for "nixos-25.05" -> 25.05.<date>.<rev>
-  2. broker: nix profile install nixpkgs/<rev>#ripgrep      (through the proxy)
+  2. guest-exec: nix profile install nixpkgs/<rev>#ripgrep     (through the proxy)
   3. record output path + nar hash into tools.lock.json
   4. write manifest to the registry; tool becomes callable
 ```
 
-`tools.lock.json` is what makes `vm reset` cheap and reproducible:
+`tools.lock.json` is what makes a guest rebuild reproducible and what `doctor` verifies: the same
+manifest still resolves to the same store path, and a nar hash mismatch is reported rather than
+reconciled. There is no `vm reset` any more (`D-041`), so the lockfile is a **reproducibility and
+drift record** first, and a reinstall recipe second — the AI's own package installs are per
+`tools install` and are not removed from the overlay by anything Bothea does.
 
 ```json
 {
@@ -124,14 +141,30 @@ If it is not, install fails with that sentence rather than a Nix stack trace.
 
 ## 3. Wire protocol
 
-Length-prefixed JSON frames over stdio (FR-P1). LSP-style, because newline-delimited JSON
-cannot carry a 4 MB tool output and will corrupt the stream the first time it tries.
+Length-prefixed JSON frames (FR-P1). LSP-style, because newline-delimited JSON cannot carry a
+4 MB tool output and will corrupt the stream the first time it tries.
 
 ```text
 Content-Length: <bytes>\r\n
 \r\n
 <utf-8 json>
 ```
+
+**Carrier note (`D-040`).** The frames are no longer carried over a long-lived stdio channel,
+because there is no `bothea-broker`. Each frame is a file or a `guest-exec` argument, and the
+message set below is unchanged while the transport is not:
+
+| Frame | Carrier in the guest-agent world |
+|---|---|
+| `hello` / `hello_ok` | one `guest-exec` of `bothea-tool hello` per VM session |
+| `invoke` | a `guest-exec` of `bothea-tool run`, with the arguments in a file |
+| `progress` | derived by the core from the output file's byte offsets (`guest-file-read`) |
+| `cancel` | a `guest-exec` of `bothea-tool cancel --pid <pid>` |
+| `result` | read from the status file, not returned on a stream |
+| `ping` / `pong` | the agent's own round trip (`guest-sync`) |
+
+The limits in the table further down are still enforced by the core, and a framing error is
+still `protocol_error`.
 
 ### Messages
 
@@ -164,34 +197,40 @@ Content-Length: <bytes>\r\n
 A `hello`/`hello_ok` mismatch is fatal for that plugin, logged, and surfaced as
 "`ripgrep` speaks protocol 2, core speaks 1". No coercion, no best-effort.
 
-## 4. The broker
+## 4. Running a tool in the guest
 
-**Why it exists.** The tools live in the guest; the core lives on the host. Without a
-long-lived multiplexer, every tool call would pay an SSH handshake and there would be nowhere
-to enforce cancellation.
+**What replaced the broker (`D-040`).** There is no long-lived `bothea-broker` and no SSH. The
+core runs a small guest-side helper, `bothea-tool`, through the QEMU guest agent's `guest-exec`,
+and streams by reading the file the helper writes:
 
 ```text
-core ──ssh──> bothea-broker --serve
-                 ├─ frame router (invoke → subprocess)
-                 ├─ subprocess spawner (systemd-run --scope limits)
-                 ├─ file get/put (for git bundles, artifacts)
-                 └─ ping / health
+core ──guest-exec──> bothea-tool run --id 42 --tool rg --args /tmp/bothea/42.args
+                        ├─ systemd-run --scope limits, as user `ai` (D-041)
+                        ├─ stdout/stderr -> /tmp/bothea/42.out, byte offsets preserved
+                        └─ outcome -> /tmp/bothea/42.status
+core ──guest-file-read(offset)──> progress frames (seq = byte offset)
+core ──guest-exec-status────────> exit code, and the pid for cancellation
+core ──guest-exec──> bothea-tool cancel --id 42   (SIGTERM, 5 s, SIGKILL)
 ```
 
 Responsibilities, in order of importance:
 
 1. **Spawn tools under limits**: `systemd-run --scope -p MemoryMax=… -p CPUQuota=… -p
-   TasksMax=…` as user `bothea`, with `cwd` inside the workspace and no host path visible.
-2. **Stream** stdout/stderr as `progress` frames with sequence numbers, so the core can show
-   progress without buffering.
-3. **Cancel** cleanly: `cancel` → SIGTERM to the process group → 5 s → SIGKILL. Report
-   `cancelled`, not `failed`.
-4. **Never** touch the host. It has no host mount and no credential; its only secret is the
-   scoped egress token it hands to a tool.
-5. **Commit the guest branch** on request (`bothea.commit`), implementing FR-S8 so crash loss
-   is bounded by one step.
+   TasksMax=…` as user `ai`, with `cwd` inside the workspace and no host path visible.
+2. **Stream** by writing stdout/stderr to a file the core reads at increasing offsets, so
+   progress needs no buffering and `seq` is the offset (`FR-T2`).
+3. **Cancel** cleanly: SIGTERM to the process group → 5 s → SIGKILL, reported as `cancelled`,
+   not `failed`.
+4. **Never** touch the host. The helper has no host mount and no credential; its only secret is
+   the scoped egress token it hands to a tool.
+5. **Commit the guest branch** on request (`bothea-tool commit`), implementing `FR-S8` so crash
+   loss is bounded by one step.
 
-One broker per VM session. If it dies, the VM is `failed` and the run ends (FR-T3).
+The helper is one process invocation per call, not a per-session daemon: a tool call costs a
+`guest-exec` and a file open, and there is no socket to keep alive. If the agent stops answering,
+the VM is `failed` and the run ends (`FR-T3`), and an in-flight tool is never retried. The file
+offset protocol is a **requirement to earn**, not inherited behaviour — it is one of the M2
+measurements (`D-040`).
 
 ## 5. First tool set (M4 scope)
 
@@ -200,10 +239,10 @@ Deliberately small, and chosen because they cover the loop's needs without a plu
 | Tool | Purpose | Permissions |
 |---|---|---|
 | `fs.read` | read a file or a line range | `read` |
-| `fs.write` | create or overwrite | `write` |
-| `fs.patch` | apply a unified diff | `write` |
+| `fs.write` | create or overwrite | `create`, `modify` |
+| `fs.patch` | apply a unified diff | `modify` |
 | `search` | ripgrep wrapper | `read` |
-| `shell` | run one command in the guest | `shell` |
+| `shell` | run one command in the guest | `shell` (declared `ask` while the lead is reviewing) |
 | `git.status` / `git.diff` | give the model its own context | `read` |
 
 `fs.patch` before `fs.write` matters: whole-file rewrites are how an expert destroys a file it

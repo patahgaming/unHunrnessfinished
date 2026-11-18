@@ -17,15 +17,15 @@ bothea core (Rust)
   git: snapshots, merge, refs, bundles
   QEMU process manager + control channel client
         |
-        +-- egress proxy  (127.0.0.1:18080)  <----+     control channel (SSH over
-        |     allowlist, key injection, log        |     hostfwd 127.0.0.1:22022)
+        +-- egress proxy  (127.0.0.1:18080)  <----+     control channel (QEMU guest
+        |     allowlist, key injection, log        |     agent, virtio-serial)
         |                                          |
-        |    [external, user-run]                   +--> bothea-broker
-        +-- 9router  (127.0.0.1:20128)              |      multiplexes tool calls
+        |    [external, user-run]                   +--> bothea-tool
+        +-- 9router  (127.0.0.1:20128)              |      one call per guest-exec
         |     provider keys live in its config      |
         |                                          |
         |    [external, user-run]                   +--> tool processes
-        +-- llama-server (127.0.0.1:18090)          |      (unprivileged user)
+        +-- llama-server (127.0.0.1:18090)          |      (user `ai`, may sudo)
         |     Bothea only checks /health            |
         |                                          |
         +-- key store (mode 600, Bothea-only)       +--> git clone of workspace
@@ -33,9 +33,13 @@ bothea core (Rust)
         +-- host git repo == lead's working tree ---+      (bundles only, no remote)
 ```
 
-Two of these are **not Bothea's processes** (`D-009`, `D-021`): 9router and llama-server are
-applications the lead runs. Bothea reaches them over HTTP, health-checks them, and records what
-it found. It never spawns, signals, or supervises either one, and it never holds a provider key.
+Three of these are **not Bothea's processes** (`D-009`, `D-021`, `D-045`): NullClaw, 9router and
+llama-server are applications the lead runs. Bothea reaches 9router and llama-server over HTTP,
+health-checks them, and records what it found. The direction with NullClaw is the other way
+round: NullClaw invokes Bothea as a local tool (`bothea run …`), so the gateway is upstream of
+the core. Bothea never spawns, signals, or supervises any of the three, and it never holds a
+provider key. NullClaw is nevertheless **delivered inside Bothea's own bundle**, built from the
+vendored source in the same pass (`D-052`) — shipped together, still a separate process.
 
 There are exactly **two copies of the workspace**: the host working tree, and the guest
 clone. The rev-2 draft's third copy ("human workspace folder" separate from "host git repo")
@@ -45,13 +49,14 @@ is removed — it is a merge source that adds conflicts and buys nothing (`D-012
 
 | Process | Lives on | Lifetime | Talks to |
 |---|---|---|---|
-| `bothea` core | host | per invocation | everything on the host; guest over one SSH channel |
+| `bothea` core | host | per invocation | everything on the host; guest over the QEMU guest agent |
+| NullClaw | host | **external, the lead's — shipped in Bothea's bundle** | channels; invokes the `bothea` skill; Bothea only reads its `/health` |
 | egress proxy | host | per VM session | core (write side), guest (read side), 9router |
 | 9router | host | **external, the lead's** | proxy, providers |
 | llama-server | host | **external, the lead's** | Bothea (health + inference calls) |
 | QEMU | host | per VM session | core (child process), proxy, guest |
-| `bothea-broker` | guest | per VM session | core (stdio over SSH), tool processes |
-| tool process | guest | per invocation | broker, proxy (scoped token only) |
+| `bothea-tool` | guest | per invocation | core (via `guest-exec`), tool processes |
+| tool process | guest | per invocation | `bothea-tool`, proxy (scoped token only) |
 | expert plugin | host | per turn | core |
 
 Every one of these is a separate process. Nothing is linked into the core except the task
@@ -63,18 +68,25 @@ responsibility ends at "is it answering", not at "is it running" (`D-021`).
 ```text
   TRUSTED                      SEMI-TRUSTED                UNTRUSTED CODE
   ---------                    ------------                -------------
-  core, key store       ->     9router, proxy,      ->     guest: broker, tools,
+  core, key store       ->     9router, proxy,      ->     guest: bothea-tool, tools,
   host git repo, log           llama-server                installed programs, AI output,
   QEMU process                                             anything it writes
 ```
 
 - The core and the key store are trusted. Everything the core writes (repo, log) is the
-  source of truth. The key store holds only Bothea's own material — the guest ssh key, the
-  9router client key, per-session tokens. Provider keys are not in it (`D-009`).
+  source of truth. The key store holds only Bothea's own material — the 9router client key,
+  per-session tokens, and the optional llama-server key. There is **no guest key at all**
+  (`D-040`). Provider keys are not in it (`D-009`).
 - 9router and llama-server are external applications the lead runs, not components Bothea
   owns. They hold their own configuration (9router holds the provider keys), they are treated
   as compromisable, and Bothea only ever talks to them over loopback HTTP and records what it
   found.
+- **NullClaw is a lead-run application, like the two above, with one difference that matters:**
+  it acts on the host with the lead's own privileges and it is driven by untrusted inbound
+  content. Bothea's boundary does not cover its internal actions (`D-045`), and what Bothea can
+  see of it — the origin on `run.start`, the pinned version and hash — is recorded. Its guardrails
+  are NullClaw's own: pairing, per-channel allowlists, `workspace_only`, supervised autonomy,
+  sandbox backend, audit log.
 - The guest is untrusted **by construction**. AI-written code runs there; assume it will try
   to escape. The only contract with the guest is: it may reach the proxy, it may reach
   nothing else, and it holds no secret.
@@ -88,11 +100,13 @@ These are checked by tests, not by hope.
 - **I2** No secret is present in the guest image, the guest filesystem, any sync payload, or
   any log line.
 - **I3** The guest never initiates a connection to the host. The control channel is host→guest
-  only (`D-002`).
+  only, over the QEMU guest agent (`D-040`).
 - **I4** Every tool execution is preceded by a logged permission decision.
 - **I5** Every run is bounded by explicit budgets; no code path loops without one.
-- **I6** One run has one expert, unless the lead reassigns mid-run.
-- **I7** The VM can be destroyed at any moment without losing committed work.
+- **I6** One run has one expert, unless the lead reassigns mid-run. A subagent is a bounded
+  child run of that expert (`D-035`), not a second expert.
+- **I7** Every committed change is in the host repository, and Bothea never destroys the guest
+  filesystem: the VM is durable and baseline-verified, not expendable (`D-041`).
 - **I8** Any state change not present in the log did not happen; the log is append-only and
   `seq` is monotonic.
 - **I9** A merge conflict is never resolved without the lead. No manifest, config, or flag can
@@ -117,7 +131,7 @@ run(request, budget):
           log(permission.decision, call, decision)
           if decision is deny:  turn.note_denied(call); continue
           if decision is ask:   if not lead.approves(call): turn.note_denied(call); continue
-          result = vm.invoke(call)                   # FR-T2, over the broker
+          result = vm.invoke(call)                   # FR-T2, over the guest agent
           log(tool.result, call, result.summary)
           context.append(result)
       guest.commit("step " + step)                   # FR-S8: crash costs at most one step
@@ -143,7 +157,15 @@ Design notes worth stating explicitly, because they are easy to get wrong:
 - **`blocked` is not an ending.** `ok`, `failed`, and `budget` finish a run; `blocked` parks it
   until the lead resolves a conflict, and `--continue` resumes at the next step.
 - **`route()` respects the default.** With routing disabled (`D-007`), it returns the lead's
-  `--expert` or prompts with the candidate list; it never guesses.
+  `--expert` or prompts with the candidate list; it never guesses. `D-033` renames that switch
+  to `router.mode = "manual"` and gates `auto` behind a measurement.
+- **Subagents are child runs, not experts.** A spawn is a logged allocation of the parent
+  run's budget, bounded by the parent's expert and permissions, and serial in the first release
+  (`FR-E8`, `D-035`). The loop above is still the only loop the core owns: a subagent runs
+  inside it, it does not start a second one.
+- **`SOUL.md` is read once, at session start.** Its sha256 goes on `run.start`, and an edit —
+  including the AI's own — takes effect at the next session, so a run's rules cannot be changed
+  by the run (`D-047`).
 
 ## 6. State that matters
 
@@ -153,7 +175,9 @@ Design notes worth stating explicitly, because they are easy to get wrong:
 | AI's work, uncommitted | guest working tree | core | VM crash → at most one step |
 | AI's work, synced | host `main` (merge commit) | core | never (merged after every step) |
 | Run transcript | session log, `state/logs/` | core | disk failure |
-| Installed tools | guest image overlay | core | `vm reset` (rebuild from manifest lockfile) |
+| Project memory | `./memory` in the workspace | AI + core | synced like any file; never secrets (`D-045`) |
+| Gateway conversation memory | NullClaw's own data dir | NullClaw | not Bothea's; never synced (`D-045`) |
+| Installed tools, guest state | guest image overlay | AI + core | never by Bothea: the overlay is never discarded (`D-041`) |
 | Credentials | key store + 9router SQLite | lead | never syncs, never backs up via Bothea |
 | Snapshots | `refs/bothea/snapshots/*` | core | retention policy |
 
@@ -169,7 +193,9 @@ browser session (out of scope, but adjacent).
   Mitigated by: no keys in guest, no host share, egress allowlist, per-session tokens, image
   reset.
 - *A2 — A malicious or compromised tool package.* Mitigated by: pinned nixpkgs revision and
-  output hash, unprivileged user, resource limits, scoped (not master) egress token.
+  output hash, the `ai` account's resource limits, a scoped (not master) egress token, and the
+  baseline verification that runs at every start (`D-041`). The account may `sudo`, so the
+  guard is detection at start, not prevention at run time.
 - *A3 — A compromised 9router or llama-server.* Mitigated by: loopback binding, an API key on
   each (Bothea's client key for 9router, the lead's own `--api-key` for llama-server, which
   Bothea sends from its store), the fact that neither holds the lead's other credentials, and
@@ -204,6 +230,7 @@ Every one of these is recorded at first use and checked by `doctor`:
 | Guest image | sha256 of the base qcow2 |
 | nixpkgs | git revision used for tool installs (per lockfile entry) |
 | 9router | version string from its API; commit recorded by the lead when pinning |
+| NullClaw | version string + source commit + the build hash of the bundled binary; vendored `v2026.5.29` (`D-045`, `D-052`) |
 | llama-server | version string from `/props` when it reports one; recorded as `unavailable` otherwise |
 | GGUF | repo id, filename, sha256, license |
 | Config | schema version + the effective resolved config, logged per run |

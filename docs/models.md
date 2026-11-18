@@ -1,7 +1,7 @@
-# Models, routing, and the deferred Claude Code plugin
+# Models, routing, and the cancelled Claude Code plugin
 
-Requirements FR-E1..E7. Covers local GGUF experts, the two external services (llama-server,
-9router), the router, and the deferred Claude Code plugin.
+Requirements FR-E1..E8. Covers local GGUF experts, the two external services (llama-server,
+9router), the router, and the cancelled Claude Code plugin.
 
 ---
 
@@ -42,8 +42,32 @@ refuse if required > free_ram - 1024 MB   (1 GB safety margin)
 ```
 
 Worked example, 7B Q4_K_M at 8k context: weights ≈ 4.4 GB, KV ≈ 1.1 GB, overhead 0.5 GB →
-required ≈ 6.0 GB. On a 16 GB machine with the VM at 4 GB and 2 GB reserved, that leaves 10 GB
-free, so it fits with 4 GB to spare.
+required ≈ 6.0 GB.
+
+**What the 8 GB VM does to that arithmetic** (`D-031`). On a 16 GB host with the VM at 8 GB and
+2 GB reserved for the OS and the core, 6 GB is left, and the 1 GB safety margin makes the usable
+budget 5 GB. A 7B at 8k does not fit; a 3–4B at 8k (weights ≈ 2.0–2.5 GB, KV ≈ 0.6–1.2 GB)
+does. That is why the default expert is 3–4B class and 7B is documented as the
+"lower `vm.memory_mb` to 4096, or use a ≥ 24 GB host" option (`D-027`, amended).
+
+The machine this is written for has **40 GB** installed (answer 26), so the 16 GB case above is
+the lower bound rather than the target: on 40 GB a 7B at 8k fits **in RAM** with room to spare.
+That is not permission to change the default — a model offloaded to the GPU is bounded by the
+host's **6 GB VRAM**, a different budget entirely (`D-043`). The 3–4B default is revisited by
+measurement, not by reading the RAM figure. The fit check still refuses with its arithmetic on
+whatever host it runs on.
+
+```text
+KV cache at increasing context, 7B-class, GQA 8x128 heads, f16
+   8k  ≈ 1.1 GB        16k ≈ 2.2 GB
+  32k  ≈ 4.2 GB        60k ≈ 7.9 GB
+```
+
+At the 60K ceiling (`D-032`) the KV cache alone is larger than the whole VM budget on a 16 GB
+host, for any model class. Long local contexts are therefore a host-capacity question, not a
+prompt-length question: either the host has the RAM, or the request goes to an API model. KV
+quantisation (`--cache-type-k q8_0`) roughly halves the column; when the lead uses it, the
+manifest records `kv_type` so the check uses the number that is actually resident.
 
 The estimate is deliberately conservative on weights (assumes full residency rather than
 partial mmap). An estimate that is sometimes wrong in the "loads anyway" direction is fine; one
@@ -97,18 +121,20 @@ deferred, not rejected.
 
 | Field | Default | Why |
 |---|---|---|
-| class | 7B-class instruct/coder model | fits the 16 GB worked example with a 4 GB VM (6.0 GB required) |
+| class | 3–4B-class instruct/coder model | fits a 16 GB host with the 8 GB VM (`D-031`); 7B needs a 4 GB VM or a ≥ 24 GB host |
 | quantisation | Q4_K_M | 8-bit loses too much quality for the size it costs |
-| `ctx` | 8192 | matches the sizing example; larger contexts change the arithmetic |
-| weights | ≈ 4.5 GB | the number the budget check uses |
+| `ctx` | 8192 | the context the fit check uses; larger contexts are the KV table above |
+| weights | ≈ 2.0–2.5 GB | the number the budget check uses |
 | `sha256` | recorded at install | never asserted in these docs; a doc cannot pin bytes it does not hold |
 | `license` | required | commercial use of output is a real question, answered once |
 
-The example name is Qwen2.5-Coder-7B-Instruct, but the model id is a manifest field, not a
-requirement. `router.model` — the tie-break model — is a small 1.5–2B model, *not* the default
-expert: it exists to break ties, and spending 4.5 GB to do that would defeat the point. The
-earlier 30B example is removed; at Q4_K_M it does not fit a 16 GB host with a 4 GB VM, and a
-default that cannot run is worse than no default.
+The example name is Qwen2.5-Coder-3B-Instruct, but the model id is a manifest field, not a
+requirement. `router.model` — the tie-break model — is a small model, *not* the default
+expert: it exists to break ties, and spending 2.5 GB to do that would defeat the point
+(`D-033` makes it an API model for now, so the local 1.5–2B variant is the fallback shape, not
+the shipped one). The earlier 30B example was removed for the same reason at the other extreme:
+at Q4_K_M it does not fit a 16 GB host with an 8 GB VM, and a default that cannot run is worse
+than no default.
 
 ## 3. API experts through 9router
 
@@ -123,8 +149,9 @@ or read its database.
 ```
 
 - **Provider keys live in 9router's configuration, on the host.** Bothea does not manage them
-  and never sees them. The key store holds only Bothea's own material (the VM ssh key, the
-  9router client key, per-session tokens).
+  and never sees them. The key store holds only Bothea's own material: the 9router client key,
+  per-session tokens, and the optional llama-server key. There is **no guest ssh key** — the
+  guest agent replaced SSH and no key exists (`D-040`, `FR-SEC5`).
 - **9router is not part of the VM session.** It is not bound to a VM lifetime, so stopping a VM
   never kills a provider connection, and a 9router restart does not require a VM restart.
   Bothea health-checks the endpoint at VM start and reports, rather than owning a lifecycle it
@@ -169,21 +196,30 @@ that behaviour is the part with terms risk and the part Bothea does not need.
 
 **Output.** One expert name, one reason string, one confidence band. Logged and shown.
 
-**Algorithm** (tags first, per FR-E3). Routing is **off by default** (`D-007`):
+**Algorithm** (tags first, per FR-E3). Routing is **off by default** (`D-007`), which `D-033`
+renames rather than reverses: `router.mode = "manual"` is the default, and `auto` becomes
+selectable only after the gate in `D-033` passes **on this host** — `p50 ≤ 2 s`, `p95 ≤ 5 s`,
+router residency `≤ 3 GB` beside the 8 GB guest and llama-server, and `≥ 85%` top-1 agreement
+with the expert the lead would have chosen, on a labelled task set. The router backend is an
+API model for now; Jev-Omni is not the default and is not pinned, because a 12B model does not
+fit this host's 6 GB VRAM at BF16 or Q8.
 
 ```text
-0. if router.enabled == false:  the lead's --expert wins, no scoring
+0. if router.mode == "manual":  the lead's --expert wins, no scoring
                                 interactive + no flag -> prompt with the candidate list
 1. score each expert by tag overlap with the request
       tokenise request -> terms; a tag matches on exact term or stem
 2. if a single expert has the top score > 0: choose it, reason = "tags: rust, refactor"
 3. if tie or no score:
-      if router.mode == "model" and router.model is being served
-         at llama.base_url (checked, not assumed):
-           ask the small model, constrained to the candidate set
+      if router.backend answers (checked, not assumed):
+           ask the backend, constrained to the candidate set
       else:
            ask the lead (interactive) or refuse (unattended)
 ```
+
+`router.backend.kind = "api"` is the shipped shape (`D-033`); a local backend would restore the
+"small model served at `llama.base_url`" path that the earlier text describes, and nothing in
+the loop changes when it returns.
 
 **Validating tags before enabling.** Tags are metadata that cannot rot silently, so they are
 scored even while routing is disabled:
@@ -194,8 +230,10 @@ bothea experts suggest "refactor the parser"     # prints top-3 with scores and 
 
 The lead runs it against a handful of real requests, compares the suggestion to the expert they
 actually chose, fixes the tag file, and enables routing when the two agree. Enabling is a
-recorded action (`bothea config set router.enabled true`, logged as `router.enable`), so the
-date and the reason are in the history rather than in memory.
+recorded action (`bothea config set router.mode auto`, logged as `router.enable`), and it is
+refused until a `bothea router measure` run has logged `router.gate` with `verdict = pass`
+(`D-033`), so the date and the numbers behind the switch are in the history rather than in
+memory. The tags are still the signal; the gate is about the router's own cost.
 
 **Why off by default.** Routing is the one place the system chooses on the lead's behalf. With
 one user and a handful of experts, the manual cost is a flag; the cost of a wrong silent choice
@@ -220,9 +258,17 @@ configured price per model. The estimate is labelled an estimate; Bothea never c
 the bill.
 
 Run totals roll up into `run.end`. The lead can then answer "what did this cost me" without
-opening a dashboard.
+opening a dashboard. Usage is also a **limit**, not only a report: `max_total_tokens_per_run`
+(50 000 000), `max_cost_usd_per_run` (USD 2) and `[limits.cost] per_provider_daily_usd`
+(USD 20) stop the run with the numbers printed (`D-036`). A local expert is not billed, so
+wall clock is its bound and the cost caps never fire for it.
 
-## 6. Claude Code — a plugin tool, deferred
+## 6. Claude Code — cancelled
+
+> **Cancelled 2026-11-18 (`D-037`).** This section is kept as the record of what was decided
+> about it. No API-key decision was taken, nothing here is a pending task, and `K-3` is
+> historical. If it is ever reinstated, the conditions below still apply: API key only
+> (`D-011`), explicit lead invocation, and the terms checked before any code is written.
 
 **Decision (`D-013`): Claude Code is a plugin tool, and it is out of scope until after M3.** It
 is not part of the core and requires no core work to support it beyond the generic tool plugin
