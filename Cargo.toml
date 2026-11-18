@@ -1,0 +1,16 @@
+[package]
+name = "bothea"
+version = "0.1.0"
+edition = "2024"
+description = "Bothea — contained coding harness. This is the M0/M1 skeleton: CLI, bundle verification, NullClaw checklist."
+license = "MIT"
+
+[[bin]]
+name = "bothea"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

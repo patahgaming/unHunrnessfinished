@@ -1,0 +1,15 @@
+# build output
+/target/
+/dist/
+/.tools/
+/.tmp/
+
+# NullClaw vendored tree (D-052).
+# This is a shallow clone of github.com/nullclaw/nullclaw at the pinned release commit.
+# It is intentionally not committed yet: the recorded plan is a pinned submodule, and a
+# 20k-file tree is not something to add to this repo in the same pass that creates it.
+# `scripts/build-bundle.ps1 -Vendor` restores it at the pinned tag.
+/vendor/
+
+# local state the spec describes but the skeleton does not create yet
+/state/

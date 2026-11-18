@@ -1,0 +1,120 @@
+# Bothea default config — shipped inside the bundle (D-052).
+# Paths are relative to the bundle root unless absolute. Nothing here is secret; the key
+# store holds secrets and `bothea.toml` never does.
+schema = 1
+
+[workspace]
+root  = "workspace"        # the host git repo == the lead's working tree
+state = "state"            # logs, artifacts, keys, overlays, archives, pid files
+models = "models"          # GGUF store; never synced
+
+[vm]
+image         = "images/nixos-25.05-bothea.qcow2"
+image_sha256  = ""
+cpus          = 2                  # D-031
+memory_mb     = 8192               # D-031
+disk_gb       = 50                 # D-031
+accel         = "whpx"             # only supported value (D-016)
+proxy_port    = 18080
+boot_timeout_s = 90
+boot_seconds_expected = 0
+
+[egress]
+# The host list is OPEN (D-049): the lead has not supplied it. The entries below are
+# placeholders, not final values. Add a host only with a reason; it is logged.
+allow = [
+  "cache.nixos.org",      # placeholder, not ratified (D-049 open)
+  "channels.nixos.org",   # placeholder, not ratified (D-049 open)
+]
+plaintext = ["9router.internal"]
+
+[permissions]
+# Host ceilings (D-034). Six action types; a manifest can only be stricter.
+read    = "allow"
+create  = "allow"
+modify  = "allow"
+delete  = "allow"       # inside the workspace only; outside is always deny
+shell   = "allow"
+network = "ask"
+
+[limits]
+max_steps                = 20
+max_tool_calls           = 60
+max_wall_clock_min       = 30
+max_wall_clock_long_min  = 1440
+max_tokens               = 200_000
+max_total_tokens_per_run = 50_000_000
+max_cost_usd_per_run     = 2.00
+
+[limits.cost]
+per_provider_daily_usd = 20.00
+
+[subagents]
+enabled            = false
+depth              = 2
+concurrent         = 1
+max_wall_clock_min = 1440
+
+[nullclaw]
+# Written by the bundle build; do not edit by hand (D-052).
+# Full feature set, but its own tools are disabled: all tool execution goes through
+# Bothea and the VM. Its memory and soul are owned by NullClaw (D-045 clarification).
+source_tag    = "v2026.5.29"
+source_commit = "b25c6eb59f845f4f8cdbb50d6f284cb56d723435"
+build_zig     = "0.16.0"
+binary_sha256 = ""
+base_url      = "http://127.0.0.1:3000"
+token         = "keyring:bothea-nullclaw"
+skill         = "bothea"
+channels      = []
+
+[memory]
+path   = "./memory"
+max_mb = 64
+
+[tools]
+lazy_detail = true
+
+[soul]
+path   = "SOUL.md"
+max_kb = 32
+
+[disk]
+# PROPOSALS ONLY — `D-050` is open; these are not ratified values.
+warn_pct            = 80
+refuse_new_runs_pct = 90
+stop_active_pct     = 95
+
+[router]
+mode = "manual"
+
+[router.gate]
+p50_ms   = 2000
+p95_ms   = 5000
+ram_mb   = 3072
+accuracy = 0.85
+
+[router.backend]
+kind  = "api"
+model = ""
+
+[llama]
+base_url = "http://127.0.0.1:18090"
+api_key  = ""
+
+[nine_router]
+base_url   = "http://127.0.0.1:20128"
+client_key = "keyring:bothea-nine-router"
+proxy_host = "9router.internal"
+
+[sync]
+when                     = "per_step"
+snapshot_refs            = "forever"
+prune_content_after_days = 30
+large_untracked_mb       = 10
+max_file_mb              = 10
+autocrlf                 = false
+
+[logs]
+max_mb        = 64
+keep_archives = 30
