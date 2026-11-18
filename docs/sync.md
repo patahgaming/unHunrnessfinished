@@ -49,6 +49,8 @@ Properties that matter:
   can disturb it.
 - **`.gitignore` respected.** Models, state, and VM images never enter the object store
   (FR-S6). This is the mechanism, not a separate filter.
+- **Refs are never deleted.** Snapshot history is kept indefinitely; disk is bounded by
+  pruning content, not by pruning refs (§7).
 
 **Before every merge**, the core takes a snapshot and logs `snapshot.create` with the ref.
 **Before `vm reset`, before `--restore`, and before the first sync of a session**, likewise.
@@ -122,6 +124,10 @@ Deliberate choices:
 
 ## 5. Conflicts
 
+**No conflict is ever auto-resolved.** Not by a manifest declaration, not by a config key, not
+by a flag, not by an expert (`D-020`). The guest can create a conflict; only the lead can
+resolve one.
+
 **What counts as a conflict** (git's rules, adopted as-is):
 
 | Host | Guest | Result |
@@ -134,7 +140,7 @@ Deliberate choices:
 | added | added (same path, different content) | **conflict** |
 | deleted | modified | **conflict** |
 | modified | deleted | **conflict** |
-| renamed | modified old path | **conflict** (git may auto-resolve; if it does, log it as `merge-rename`) |
+| renamed | modified old path | git tracks the rename → applies it, logs `merge-rename`; rename not detectable → **conflict** |
 | mode/exec bit only | — | never a conflict: mode tracking is off (§6) |
 
 **Presentation.** The lead sees, per conflicting path: the host version, the guest version,
@@ -214,12 +220,33 @@ One JSON object appended to the session log per sync (FR-S7). Shape:
 }
 ```
 
-`files` is the full per-file list in the artifact, and the log line carries a summary
-(`files: 3`) plus the pointer. Two destinations, each suited to its reader (`D-015`).
+The entry carries a summary plus a per-file `name-status` list captured from
+`git diff --name-status`. Full diffs are **not** stored — git already has them, and duplicating
+them would create a second source of truth that can disagree with the repository (`D-015`).
+`bothea sync --explain <sync_id>` renders the file list and the diffs on demand from the
+recorded `base`, `host`, and `vm` ids.
 
-**Retention.** Snapshots are pruned to `max(retain_min = 20, retain_days = 14)`, and the
-snapshot taken before the most recent sync is never pruned. Prune is a `update-ref -d` plus
-`gc --prune=now`, logged.
+**Retention.** Snapshot **refs are kept indefinitely**; nothing is ever deleted from
+`refs/bothea/`. Disk is bounded by pruning *content* instead:
+
+| Content | Retained | Then |
+|---|---|---|
+| tracked files (at snapshot time) | forever | never pruned |
+| untracked, under `sync.large_untracked_mb` (default 10) | forever | never pruned |
+| untracked, at or over the threshold | `sync.prune_content_after_days` (default 30) | dropped from snapshot trees |
+| gitignored (models, caches, images) | `sync.prune_content_after_days` | dropped from snapshot trees |
+
+`bothea sync prune` walks refs older than the threshold, rewrites those trees to exclude the
+prunable entries, records exactly which paths were dropped per snapshot, then runs
+`git gc --prune=now` to expire the now-unreachable blobs. Each pass logs `snapshot.prune` with
+path count and bytes reclaimed.
+
+Rewriting an old snapshot tree is safe because each snapshot is a full, independent tree and
+the working branch is never touched. The consequence must be stated plainly rather than
+discovered later: **after 30 days, `--restore` cannot recover a large untracked file or an
+ignored file from that snapshot.** Tracked work and small untracked work — the things that are
+actually someone's effort — are never dropped. `doctor` reports the snapshot store's size so
+the lead can see the bound working.
 
 ## 8. Fixture matrix (S2 and M3 acceptance)
 

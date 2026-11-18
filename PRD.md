@@ -132,10 +132,13 @@ free. Bothea refuses with the arithmetic and does not start a model.
 
 - **FR-S1** Sync MUST create a recoverable snapshot of the host working tree, including
   untracked files, before any merge, and the snapshot MUST NOT appear on the working branch.
+  Snapshot refs MUST be retained indefinitely; pruning MAY remove only gitignored entries and
+  untracked entries at or above the configured size threshold, after the configured age.
 - **FR-S2** Sync MUST apply a three-way merge with git semantics: one-sided changes apply;
   disjoint changes merge; overlapping changes conflict.
 - **FR-S3** On conflict, sync MUST stop, leave both sides' work intact, and require an
-  explicit lead decision per path. It MUST NOT auto-resolve.
+  explicit lead decision per path. It MUST NOT auto-resolve, and no manifest, config key, or
+  flag MAY auto-resolve a conflict on the lead's behalf.
 - **FR-S4** Sync MUST auto-merge one-sided deletions and MUST treat delete/modify as a
   conflict.
 - **FR-S5** The AI MUST NOT be able to write to the host repository. Only the core commits,
@@ -165,9 +168,12 @@ free. Bothea refuses with the arithmetic and does not start a model.
   reached through 9router. Both MUST present the same internal interface to the core.
 - **FR-E2** Before loading a GGUF, the core MUST check file size plus a KV-cache estimate
   against free RAM and MUST refuse with the arithmetic if it does not fit.
-- **FR-E3** The router MUST select by tags first. Model-based routing MAY be enabled and MUST
-  be usable only as a tie-break. The lead MUST be able to override every decision, and the
-  decision plus reason MUST be logged and shown.
+- **FR-E3** Routing MUST default to disabled; the lead selects the expert, or picks from a
+  prompted candidate list. Tag scores MUST still be computable and shown while routing is
+  disabled. Routing MAY be enabled only as a recorded lead action after tag suggestions have
+  been validated against real requests. When enabled, tags MUST be consulted first and
+  model-based routing MAY be used only as a tie-break. The lead MUST be able to override every
+  decision, and the decision plus reason MUST be logged and shown.
 - **FR-E4** An expert MUST NOT dispatch another expert. Only the core does that, on the
   lead's instruction.
 - **FR-E5** A run MUST stay with one expert for its duration unless the lead reassigns.
@@ -178,8 +184,11 @@ free. Bothea refuses with the arithmetic and does not start a model.
 
 - **FR-SEC1** Every tool invocation MUST pass a permission decision before execution, and the
   decision plus its policy source MUST be logged.
-- **FR-SEC2** Permission classes are `shell`, `network`, `write-outside-workspace`. Each
-  resolves to `auto`, `ask`, or `deny`, with `write-outside-workspace` permanently `deny`.
+- **FR-SEC2** Action types are `read`, `write`, `delete`, `network`, `shell`. Each plugin
+  MUST declare `allow`, `ask`, or `deny` per action type in its manifest, and an undeclared
+  type MUST resolve to `deny`. The host MUST hold a ceiling per type and the effective policy
+  MUST be the stricter of declaration and ceiling. Writing outside the workspace is always
+  `deny` and is not declarable.
 - **FR-SEC3** Network egress MUST be allowlisted by host, and each request MUST be logged
   with method, host, and byte counts, and without credentials or bodies.
 - **FR-SEC4** Credentials MUST be injected by the proxy and MUST never be observable by the
@@ -208,8 +217,8 @@ free. Bothea refuses with the arithmetic and does not start a model.
 - **NFR-5 Portability**: Windows 10 2004+ / Windows 11, x64, WHPX or explicit TCG.
 - **NFR-6 Determinism**: QEMU version, guest image hash, nixpkgs revision, 9router commit, and
   every GGUF sha256 are pinned and recorded; `doctor` reports drift.
-- **NFR-7 Safety**: no configuration option may disable `write-outside-workspace: deny` or
-  the egress allowlist check.
+- **NFR-7 Safety**: no configuration option may disable the hard deny on outside-workspace
+  writes, the egress allowlist check, or the lead-only conflict rule.
 
 ## 9. Success metrics
 
@@ -275,9 +284,13 @@ host repository clean and re-runnable.
 
 ### M4 — Plugins and tools
 
+**Entry:** the lead has explicitly confirmed the per-plugin permission model (D-005). It
+changes how every plugin is written, so it is a gate rather than an assumption.
+
 Protocol, broker, install model, first tool set (search, file read/write/patch, shell).
 **Exit:** FR-P1..P4, FR-T2, J5; 100 sequential invocations with no fd/process leak; a 4 MiB
-output spills to an artifact and does not stall the channel; a hung tool is cancelled cleanly.
+output spills to an artifact and does not stall the channel; a hung tool is cancelled cleanly;
+a manifest declaring `network = "allow"` is capped by the host and the cap is logged.
 
 ### M5 — Experts and router
 
@@ -304,4 +317,5 @@ written down with its source; an uninstall leaves no orphaned firewall rule or k
 | Claude Code terms prohibit the proxy path | M6 has no product | Verify early; expert path must stand alone; K-3 | M6 gate |
 | Agent edits and lead edits collide constantly | G2 violated | One collapsed working tree; per-step VM commits; snapshot refs | M3 |
 | Sync tax exceeds its value | K-2 fires | Measure at M5 with a real task | M5 |
+| Permission model changes how plugins are written | M4 slips, plugins rewritten | Confirmation gate before M4; manifests are small and mechanical | M4 |
 | Scope creep into a general framework | Never ships | N1–N6 are contractual; new plugin kinds require a decision record | every review |

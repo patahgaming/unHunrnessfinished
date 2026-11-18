@@ -86,6 +86,10 @@ These are checked by tests, not by hope.
 - **I7** The VM can be destroyed at any moment without losing committed work.
 - **I8** Any state change not present in the log did not happen; the log is append-only and
   `seq` is monotonic.
+- **I9** A merge conflict is never resolved without the lead. No manifest, config, or flag can
+  resolve one (D-020).
+- **I10** No plugin can hold a policy looser than its manifest declared, or looser than the
+  host ceiling — whichever is stricter (D-005).
 
 ## 5. The task loop
 
@@ -121,6 +125,8 @@ Design notes worth stating explicitly, because they are easy to get wrong:
   no self-extension. Only the lead continues a run.
 - **The loop is in the core, not in a prompt.** No expert is trusted to terminate its own
   loop.
+- **`route()` respects the default.** With routing disabled (`D-007`), it returns the lead's
+  `--expert` or prompts with the candidate list; it never guesses.
 
 ## 6. State that matters
 

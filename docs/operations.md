@@ -21,10 +21,13 @@ bothea vm ssh                           escape hatch: an interactive shell in th
 
 bothea sync [--dry-run] [--resolve <path>=host|guest|both]
 bothea sync --restore <ref> [--path <p>]
+bothea sync --explain <sync_id>         per-file list + diffs, derived from git
+bothea sync prune [--dry-run]           drop prunable content from snapshots > 30 days
 bothea sync doctor                      case collisions, CRLF, path length, symlinks
 
 bothea tools list|install <name>|remove <name>
 bothea experts list|add <manifest>|remove <name>|pull <name>
+bothea experts suggest "<request>"      tag scores, even when routing is disabled
 
 bothea logs [--run <id>] [--follow] [--kind <k>]
 bothea config get|set|edit
@@ -73,9 +76,11 @@ allow = [
 plaintext = []                     # hosts allowed without TLS; empty by default
 
 [permissions]
-shell                    = "auto"
-network                  = "ask"    # ask for a host not in `egress.allow`
-write_outside_workspace  = "deny"   # not configurable; listed for visibility
+# Host ceilings. A plugin declares its own policy per action type; the effective
+# policy is the stricter of the two. A manifest can never loosen these.
+shell   = "allow"
+network = "ask"    # allowlisted hosts are allowed; everything else asks
+# write_outside_workspace is always deny and is not a config key.
 
 [limits]
 max_steps          = 20
@@ -84,7 +89,7 @@ max_wall_clock_min = 30
 max_tokens         = 200_000
 
 [router]
-enabled = true
+enabled = false                    # set true only after `experts suggest` is validated (D-007)
 mode    = "tags"                   # tags | model
 model   = "qwen3-1.7b-q4"
 
@@ -92,16 +97,17 @@ model   = "qwen3-1.7b-q4"
 port_base      = 18090
 idle_unload_s  = 600
 
-[router9]                          # 9router process settings, not Bothea's own router
+[nine_router]                      # the 9router process, not Bothea's own [router]
 version = "0.5.112"                # pinned; commit recorded in state/pins.json
 port    = 20128
 require_api_key = true
 
 [sync]
-retain_days = 14
-retain_min  = 20
-max_file_mb = 10
-autocrlf    = false
+snapshot_refs            = "forever"  # refs are never deleted (D-008)
+prune_content_after_days = 30         # ignored + large untracked, content only
+large_untracked_mb       = 10
+max_file_mb              = 10
+autocrlf                 = false
 
 [logs]
 max_mb      = 64
@@ -124,9 +130,10 @@ events — `run_id`.
 | `lead.message` | `text` (verbatim) |
 | `router.decision` | `expert`, `reason`, `scores`, `mode` |
 | `router.override` | `from`, `to`, `source` (`flag`\|`prompt`) |
+| `router.enable` | `from` (`false`), `validation` (the `suggest` runs it was based on) |
 | `expert.request` | `expert`, `messages`, `tools`, `tokens_in` |
 | `expert.response` | `expert`, `text`, `tool_calls`, `tokens_out`, `cost_estimate`, `ms` |
-| `permission.decision` | `class`, `policy`, `reason`, `target`, `source` |
+| `permission.decision` | `type`, `declared`, `ceiling`, `policy`, `target`, `reason` |
 | `tool.invoke` | `tool`, `args_hash`, `args` (redacted), `cwd`, `timeout_ms` |
 | `tool.result` | `status`, `exit_code`, `duration_ms`, `bytes_out`, `truncated`, `artifact` |
 | `vm.start` / `vm.stop` / `vm.health` | `accel`, `cpus`, `memory_mb`, `image_sha256`, `boot_ms` |
@@ -134,6 +141,7 @@ events — `run_id`.
 | `egress.deny` | `tool`, `host`, `policy`, `reason` |
 | `sync.start` / `sync.end` / `sync.conflict` | see `docs/sync.md` §7 |
 | `snapshot.create` | `ref`, `reason`, `files` |
+| `snapshot.prune` | `refs`, `paths`, `bytes_reclaimed` |
 | `error` | `where`, `message`, `remedy` |
 
 **Redaction** (FR-C3) happens before the write: `Authorization`, `x-api-key`, `cookie`,
@@ -160,6 +168,7 @@ Every check prints `ok` / `warn` / `fail` with the value it observed and a one-l
 | Keys | key store ACL is owner-only · 9router SQLite ACL · no key material inside the guest image |
 | Repo | `.gitattributes` has `* -text` · `core.*` flags match §6 of `docs/sync.md` · no models/state tracked · case collisions absent |
 | Guest | broker protocol version matches core · tools.lock.json nar hashes resolve |
+| Plugins | every `[permissions]` value is in the enum · every host cap actually applied is reported · manifest hash matches the approved install |
 | Pins | QEMU/image/nixpkgs/9router/GGUF hashes match `state/pins.json`; drift is reported, never fixed silently |
 
 The canary check is part of the secret scan: `doctor` plants a known fake token inside the
@@ -188,9 +197,16 @@ Egress calls fail fast with `policy=deny` and the model is told so. The run cont
 network rather than hanging. Restart the VM to rebind.
 
 **Disk full.**
-`state/` grows from artifacts and overlays. `bothea logs --prune`, delete old overlays, delete
-unused GGUFs. `doctor` refuses a VM start below 10 GB free rather than discovering the problem
-mid-pull.
+`state/` grows from artifacts and overlays. `bothea sync prune --dry-run` shows what snapshot
+content is eligible; `bothea logs --prune`, delete old overlays, delete unused GGUFs. `doctor`
+refuses a VM start below 10 GB free rather than discovering the problem mid-pull.
+
+**I need a file from a snapshot older than 30 days.**
+Tracked files and small untracked files are always recoverable — refs are never deleted. Large
+untracked files (≥ 10 MB) and gitignored files are dropped from snapshots after 30 days by
+design (`D-008`), so if the file was one of those it is gone from that snapshot. Rebuild it, or
+restore from the most recent snapshot that still contains it (`bothea sync --restore <ref>
+--path <p>` reports which). This is the documented cost of bounded disk, not a bug.
 
 **Suspicious egress.**
 `bothea logs --kind egress.request --follow`. Every request has a tool name and a run id. If a
@@ -208,7 +224,8 @@ lock-in, no proprietary format, no database.
 | Session logs | rotated by size, `keep_archives` count |
 | Tool output artifacts | 30 days, or until the run is older than the last 20 runs |
 | Overlays | one per workspace; reset on demand |
-| Snapshots | `max(20, 14 days)`, minus the never-prune rule |
+| Snapshot refs | never deleted (`D-008`) |
+| Prunable snapshot content (ignored, untracked ≥ 10 MB) | 30 days, then tree rewrite + `gc` |
 | Serial console logs | 7 days |
 | 9router SQLite | never pruned; it is credential material |
 | `pins.json` | never pruned; it is the reproducibility record |

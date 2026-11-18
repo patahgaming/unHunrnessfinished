@@ -21,8 +21,14 @@ version = "14.1.0"
 type = "tool"
 summary = "Recursive text search"
 tags = ["search", "text", "code"]
-permissions = ["read"]           # read | write | delete | network | shell
 license = "MIT"
+
+[permissions]                    # declared policy per action type; absent = deny
+read    = "allow"
+write   = "allow"
+delete  = "allow"
+shell   = "ask"
+network = "ask"
 
 [install]                        # where the program comes from; host installs nothing
 kind = "nix"
@@ -33,6 +39,9 @@ attrs = ["ripgrep"]
 entry = "rg"                     # binary name inside the guest
 args_schema = "args.json"        # JSON Schema for the model-facing arguments
 ```
+
+`[permissions]` is part of the plugin's identity: changing it changes the manifest hash, which
+forces a re-install and a fresh approval (`docs/permissions.md` §2).
 
 ### Expert
 
@@ -64,12 +73,19 @@ max_output_tokens = 8192
 **Validation rules** the core enforces (FR-C4):
 
 - `type` decides which sections are legal. A `tool` with a `[backend]` is rejected; an
-  `expert` with `[install]` is rejected.
-- A tool may not request `write-outside-workspace`; that class does not exist for plugins.
-- An expert may never declare `shell`, `network`, `read`, `write`, or `delete`. Experts do
-  not execute; the type system says so.
+  `expert` with `[install]` or `[permissions]` is rejected.
+- `[permissions]` accepts only the five action types (`read`, `write`, `delete`, `network`,
+  `shell`) and only the three values (`allow`, `ask`, `deny`). Anything else is an error, not a
+  warning.
+- `write_outside_workspace` is not a valid key. Outside-workspace writes are always denied
+  (`docs/permissions.md` §1).
+- A declared `allow` above the host ceiling is accepted and silently capped, and the cap is
+  logged at install — the lead should see that their manifest says one thing and the host does
+  another.
+- An expert may never declare permissions at all. Experts do not execute; the type system says
+  so.
 - `sha256` for a GGUF is required. A model without a hash is not pinnable and not loadable.
-- Unknown keys are a validation error, not a warning. Silent typos in a permission list are
+- Unknown keys are a validation error, not a warning. Silent typos in a permission table are
   how guardrails get disabled.
 
 ## 2. Install model

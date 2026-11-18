@@ -18,7 +18,7 @@ This set is the specification. Where it disagrees with the rev-2 draft, this set
 | `docs/vm.md` | Hypervisor, image provenance, lifecycle, resources, transport, egress enforcement | *the sandbox* |
 | `docs/sync.md` | Git model, snapshots, bundles, merge, conflicts, Windows/Linux hygiene, tests | *the seam* |
 | `docs/plugins.md` | Plugin protocol, manifest schema, install model, broker, limits | *the extension points* |
-| `docs/permissions.md` | Permission classes, resolution, egress allowlist, proxy/9router topology | *the guardrails* |
+| `docs/permissions.md` | Per-plugin policy declarations, host ceilings, egress allowlist, proxy/9router topology | *the guardrails* |
 | `docs/models.md` | GGUF experts, llama-server, 9router, routing, Claude Code gates | *the intelligence* |
 | `docs/operations.md` | CLI, config schema, session log schema, `doctor`, runbooks | *the daily surface* |
 | `docs/decisions.md` | Decision records D-001…D-019, including the four open questions from the draft | *the reasoning* |
@@ -52,10 +52,11 @@ Fixed by the rev-2 draft (not reopened here):
 Resolved in this set, pending lead sign-off (`docs/decisions.md`):
 
 - D-001 QEMU over WSL2
-- D-005 smart/yolo replaced by three permission classes
-- D-007 router on by default, tags-first
-- D-008 snapshot retention
-- plus ten more structural decisions the rev-2 draft left implicit.
+- D-005 smart/yolo removed; policy declared per plugin, capped by the host
+- D-007 router off by default until tags are validated
+- D-008 snapshot refs kept forever; large and ignored content pruned at 30 days
+- D-020 a merge conflict is never resolved without the lead
+- plus fourteen more structural decisions the rev-2 draft left implicit.
 
 ---
 

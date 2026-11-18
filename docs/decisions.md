@@ -57,16 +57,23 @@ and by `doctor` reporting unexpected loopback listeners while a VM runs.
 **Cost:** the core needs elevation once to install the rule, and refuses to start when it
 cannot verify it.
 
-## D-005 — smart/yolo removed; three permission classes
+## D-005 — smart/yolo removed; policy is declared per plugin, capped by the host
 
-**Status:** accepted (answers rev-2 open question 2).
-**Decision:** `shell`, `network`, `write-outside-workspace`, each `auto|ask|deny`;
-`write-outside-workspace` hardcoded `deny`.
-**Why:** a mode name that means "less safe" gets turned on. Classes state the actual policy and
-each has a defensible default. `shell=auto` is safe because the guest is disposable and the
-workspace is snapshotted; `network=ask` on a new host is the only irreversible action.
-**Cost:** more config keys than one toggle. Worth it: the toggle is the thing that gets
-flipped at 2 a.m.
+**Status:** accepted; **explicit lead confirmation required before M4** (it changes how every
+plugin is written — see §11 of `PRD.md`).
+**Decision:** no global modes. Five action types (`read`, `write`, `delete`, `network`,
+`shell`), three values (`allow`, `ask`, `deny`). Each plugin declares its policy per action
+type in `[permissions]`; a missing type is `deny`. The host holds a ceiling per type, and the
+effective policy is the **stricter** of declaration and ceiling — a manifest may never loosen
+what the host allows.
+**Why:** a global mode is a single switch for a policy that is not uniform. A search tool and a
+shell tool have different honest answers, and the plugin's author knows which. Putting the
+declaration in the manifest makes it reviewable at install and diffable in review, while the
+ceiling keeps the host as the actual authority. `shell = allow` is safe because the guest is
+disposable and the workspace is snapshotted; `network` stays capped because egress is the only
+irreversible action.
+**Cost:** every plugin gains a permission table, and changing it forces a re-install. That is
+the point — privilege growth should not be silent.
 
 ## D-006 — Snapshots live in their own ref namespace
 
@@ -77,25 +84,34 @@ flipped at 2 a.m.
 what the lead sees. Plumbing gives the same recoverability with no visible cost.
 **Cost:** a bespoke restore command (`bothea sync --restore`) instead of `git checkout <sha>`.
 
-## D-007 — Router on by default, tags-first
+## D-007 — Router off by default
 
-**Status:** accepted (answers rev-2 open question 3).
-**Decision:** `router.enabled = true`, `mode = "tags"`. The small model is a tie-break only.
-**Why:** tag matching is fast, explainable, and free. A model that picks the expert adds a load,
-a failure mode, and a reason the lead cannot check. Off-by-default would mean the lead names
-the expert every time, which loses the manifest's whole point.
-**Cost:** tags must be maintained. Mitigated by logging overrides so the tag file can be fixed
-from evidence.
+**Status:** accepted (answers rev-2 open question 3; supersedes the earlier recommendation to
+enable it).
+**Decision:** `router.enabled = false`. The lead names the expert (`--expert`) or picks from a
+prompt. Tags are still scored and shown via `bothea experts suggest`, and routing is enabled
+only after those suggestions have been checked against real requests.
+**Why:** routing is the one place the system chooses on the lead's behalf, and a wrong choice is
+invisible in the transcript while still costing a run. With one user and a handful of experts,
+the manual cost is one flag. Tags must earn the switch rather than being trusted on day one.
+**Cost:** the manifest's tag metadata does nothing until validated, and routing can rot if never
+enabled. Mitigated by `suggest` scoring tags while routing is off, and by a plain-text `.tags`
+lint (`doctor` warns on tags that match no manifest term).
 
-## D-008 — Snapshot retention: max(20, 14 days)
+## D-008 — Snapshot refs kept forever; large and ignored content pruned at 30 days
 
 **Status:** accepted (answers rev-2 open question 4).
-**Decision:** keep `max(20 snapshots, 14 days)`, and never prune the snapshot taken before the
-most recent sync.
-**Why:** snapshots are refs to mostly-shared trees, so the marginal cost is small. The floor of
-20 covers "I broke something three days ago and did not notice". The never-prune rule covers the
-only snapshot whose loss is actively dangerous.
-**Cost:** unbounded in principle. `doctor` reports the count and size so it stays visible.
+**Decision:** `refs/bothea/snapshots/*` are never deleted. Disk is bounded by pruning *content*
+instead: entries that are gitignored, or untracked and at least `sync.large_untracked_mb`
+(default 10 MB), are retained for `sync.prune_content_after_days` (default 30), then dropped
+from the snapshot trees by `bothea sync prune` and their blobs expired by `gc`.
+**Why:** unbounded history is the point — the failure that matters is losing the state of a
+source file, and refs to mostly-shared trees cost almost nothing. The failure that also matters
+is a 6 GB model or a build cache quietly baked into git forever, and that is content, not
+history, so it is what gets bounded.
+**Cost:** after 30 days `--restore` cannot recover a large untracked file or an ignored file
+from an old snapshot. Documented in the runbook rather than discovered; `doctor` reports the
+snapshot store's size so the bound is visible.
 
 ## D-009 — The egress proxy and 9router are separate processes
 
@@ -142,7 +158,7 @@ That is a feature.
 
 **Status:** accepted, **blocked on the compliance gate** (`docs/models.md` §6).
 **Decision:** invocable only by an explicit lead command; never router-selected; runs in the
-guest under normal permission classes; its transcript is captured as an artifact.
+guest under the same per-action policy as any other tool; its transcript is captured as an artifact.
 **Why the exception:** it is an agent inside a tool, which contradicts "experts do not call
 experts" (rev-2 §3.2). Leaving that contradiction undocumented would mean shipping two policies.
 **Consequence if blocked:** K-3 applies — the expert + tool loop must stand alone or the
@@ -158,15 +174,17 @@ a spec that is half-missing is worse than a spec that is complete.
 **Action:** if the M1 doc is produced, it is diffed against this set once and any surviving
 requirement is merged in. Otherwise the archive note stands.
 
-## D-015 — Sync log: summary in the stream, detail in the artifact
+## D-015 — Sync log: summary plus a per-file list, diffs derived from git
 
 **Status:** accepted (answers rev-2 open question 1).
-**Decision:** one log line per sync with counts and heads; the full per-file list and diff go to
-`state/artifacts/<run>/sync-<id>.json`.
-**Why:** one-line-per-file makes the session log unreadable for a 200-file merge, and the file
-list alone (without the diff) is not enough to review anything. Two destinations, each suited
-to its reader.
-**Cost:** two places to look. Acceptable: the log line carries the artifact path.
+**Decision:** one log entry per sync carrying time, direction, heads, counts, conflict flag,
+and a per-file `name-status` list captured from `git diff --name-status`. Full diffs are not
+stored; `bothea sync --explain <sync_id>` derives them from the recorded commit ids.
+**Why:** one line per file makes the session log unreadable for a 200-file merge, and storing
+diffs duplicates what git already holds — a second source of truth that can disagree with the
+repository. The list is small enough to keep inline; the diffs are reproducible on demand.
+**Cost:** reviewing a sync needs one extra command. Acceptable: it is one command, and the ids
+are in the record.
 
 ## D-016 — TCG requires explicit opt-in
 
@@ -205,6 +223,20 @@ the class of bug this project exists to avoid.
 **Cost:** manifests need updating when the schema grows. A migration is a schema bump, which is
 the point.
 
+## D-020 — A merge conflict is never resolved without the lead
+
+**Status:** accepted.
+**Decision:** conflict resolution is not an action type, not a manifest key, not a config key,
+and not a flag. Every conflict stops the sync and waits for an explicit per-path decision.
+**Why:** a merge conflict is the one moment where the system cannot know the intent behind
+either side. Automating it produces a tree that compiles and is wrong, which is worse than a
+tree that stops. This rule also keeps the permission model honest: manifest-declared policy
+governs *actions a tool takes*, and resolving a conflict on the lead's work is not an action a
+tool takes.
+**Cost:** the lead is interrupted. Mitigated by making conflicts rare (`--no-ff`, per-step guest
+commits, one collapsed working tree) and by `--resolve <path>=both`, which preserves everything
+when the answer is not obvious yet.
+
 ---
 
 ## Mapping from the rev-2 draft
@@ -214,7 +246,8 @@ the point.
 | §2 three workspace copies | D-012 |
 | §5 WHPX with software fallback | D-016 (opt-in), plus the q35 / `kernel-irqchip=off` combination |
 | §6 "three-way, the way git merges" | `docs/sync.md` — bundles, snapshots, `--no-ff`, abort-on-conflict |
-| §7 smart / yolo open question | D-005 |
+| §7 smart / yolo open question | D-005 — per-plugin declarations, host-capped |
+| §7 "conflicts always require the user's decision" | D-020 |
 | §7 "shell commands inside the VM" | `docs/permissions.md` §2 |
 | §8 9router as the proxy | D-009, D-010 |
 | §9 Claude Code "check the terms" | `docs/models.md` §6 — a gate with three outcomes, not a checkbox |

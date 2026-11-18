@@ -95,9 +95,11 @@ owner-only.
 
 **Output.** One expert name, one reason string, one confidence band. Logged and shown.
 
-**Algorithm** (tags first, per FR-E3):
+**Algorithm** (tags first, per FR-E3). Routing is **off by default** (`D-007`):
 
 ```text
+0. if router.enabled == false:  the lead's --expert wins, no scoring
+                                interactive + no flag -> prompt with the candidate list
 1. score each expert by tag overlap with the request
       tokenise request -> terms; a tag matches on exact term or stem
 2. if a single expert has the top score > 0: choose it, reason = "tags: rust, refactor"
@@ -106,8 +108,23 @@ owner-only.
           ask the small model, constrained to the candidate set
       else:
           ask the lead (interactive) or refuse (unattended)
-4. if router.enabled == false: the lead's explicit --expert wins, no scoring
 ```
+
+**Validating tags before enabling.** Tags are metadata that cannot rot silently, so they are
+scored even while routing is disabled:
+
+```text
+bothea experts suggest "refactor the parser"     # prints top-3 with scores and the gap
+```
+
+The lead runs it against a handful of real requests, compares the suggestion to the expert they
+actually chose, fixes the tag file, and enables routing when the two agree. Enabling is a
+recorded action (`bothea config set router.enabled true`, logged as `router.enable`), so the
+date and the reason are in the history rather than in memory.
+
+**Why off by default.** Routing is the one place the system chooses on the lead's behalf. With
+one user and a handful of experts, the manual cost is a flag; the cost of a wrong silent choice
+is a bad transcript the lead has to notice. The manifest's tags have to earn the switch.
 
 **Why the small model is not the default.** It costs a model load, adds a failure mode, and is
 worse than exact tag matching at the thing tags are good at. It earns its place only as a
@@ -163,7 +180,7 @@ This is an explicit, documented exception to "experts do not call experts":
 
 - it is invocable **only** by an explicit lead command — never selected by the router, never
   proposed by another expert;
-- it runs in the guest like any tool, under the same permission classes;
+- it runs in the guest like any tool, under the same per-action policy (`docs/permissions.md`);
 - its egress is the proxy, so its model calls are logged like anything else;
 - its own transcript is captured as an artifact, because the core cannot see inside its loop;
 - its budget is the run budget plus a hard wall clock.
