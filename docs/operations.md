@@ -7,7 +7,8 @@ The daily surface: CLI, config, log schema, `doctor`, and runbooks.
 ## 1. CLI
 
 ```text
-bothea init [--workspace <path>]        create config, repo, keys, allowlist skeleton
+bothea setup [--elevate]                machine-level: firewall rule, WHPX check, image pin
+bothea init [--workspace <path>]        create config, repo, keys, seed ISO, allowlist skeleton
 bothea doctor [--json]                  check every prerequisite; pass/fail + remedy
 bothea run "<request>" [--expert <n>] [--no-router] [--dry-run]
 bothea run --continue <run_id> [--expert <n>]
@@ -15,6 +16,7 @@ bothea run --continue <run_id> [--expert <n>]
 bothea vm start [--ephemeral]
 bothea vm stop
 bothea vm status [--json]
+bothea vm probe [--accel-flag <f>]      accelerator probe only; no image, no session
 bothea vm reset                         discard overlay, reinstall from tools.lock.json
 bothea vm logs [--follow]               serial console + broker log
 bothea vm ssh                           escape hatch: an interactive shell in the guest
@@ -35,7 +37,9 @@ bothea bundle export --out <dir>        packaging (M6)
 ```
 
 Exit codes: `0` success · `1` user error (bad config, bad args) · `2` refusal (a rule blocked
-it) · `3` environment failure (VM, proxy, network) · `4` run failed or budget exhausted.
+it) · `3` environment failure (VM, proxy, network) · `4` run failed or budget exhausted ·
+`5` run blocked on a conflict or a dirty tree, resumable with `--continue` after the lead
+decides.
 
 `--dry-run` on `run` prints the router decision, the budget, the permission decisions it would
 make, and the number of tokens it estimates — and executes nothing. It is the cheapest way to
@@ -63,16 +67,18 @@ disk_gb     = 20
 accel       = "whpx"               # only supported value; emulation fallback is deferred (D-016)
 ssh_port    = 22022
 proxy_port  = 18080
-boot_timeout_s = 90
+boot_timeout_s = 90                # hard bound; NFR-2 targets 60
+boot_seconds_expected = 0          # written by S1; a regression warns, it never fails
 
 [egress]
+# Destinations the GUEST may reach directly through the proxy. Provider hosts are
+# deliberately absent: the guest has no credential for them and the proxy holds none
+# (D-028). Model traffic goes to nine_router.proxy_host instead.
 allow = [
-  "api.anthropic.com",
-  "api.openai.com",
   "cache.nixos.org",
   "channels.nixos.org",
 ]
-plaintext = []                     # hosts allowed without TLS; empty by default
+plaintext = ["9router.internal"]   # the gateway leg is local plaintext; provider TLS starts at 9router
 
 [permissions]
 # Host ceilings. A plugin declares its own policy per action type; the effective
@@ -90,20 +96,24 @@ max_tokens         = 200_000
 [router]
 enabled = false                    # set true only after `experts suggest` is validated (D-007)
 mode    = "tags"                   # tags | model
-model   = "qwen3-1.7b-q4"
+model   = "small-tiebreak"         # 1.5-2B class, served at llama.base_url (D-027)
 
 [llama]
 # External process, started and stopped by the lead (D-021). Bothea only connects.
 base_url = "http://127.0.0.1:18090"
+api_key  = ""                      # optional; set when the lead launched with --api-key
 
 [nine_router]
 # External application (D-009). Bothea only calls the HTTP endpoint; provider keys
 # live in 9router's own configuration and never enter Bothea.
 base_url    = "http://127.0.0.1:20128"
 client_key  = "keyring:bothea-nine-router"   # Bothea's only 9router secret
-expect_version = "0.5.x"                     # warn on drift; never auto-update
+proxy_host  = "9router.internal"            # the name the guest may call; mapped to base_url
+# No expect_version: the version is recorded per run and drift is reported (D-009 note
+# in docs/models.md). Configuring an expected version would assert something unverified.
 
 [sync]
+when                     = "per_step"  # per_step | end_of_run | manual (D-022)
 snapshot_refs            = "forever"  # refs are never deleted (D-008)
 prune_content_after_days = 30         # ignored + large untracked, content only
 large_untracked_mb       = 10
@@ -126,8 +136,10 @@ events — `run_id`.
 
 | `kind` | Key fields |
 |---|---|
-| `run.start` | `request`, `config_hash`, `budget`, `expert` |
-| `run.end` | `outcome` (`ok`\|`budget`\|`failed`\|`cancelled`), `steps`, `tool_calls`, `usage` |
+| `run.start` | `request`, `config_hash`, `budget`, `expert`, `dirty_paths` |
+| `run.end` | `outcome` (`ok`\|`budget`\|`failed`\|`cancelled`\|`blocked`), `steps`, `tool_calls`, `usage` |
+| `run.blocked` | `kind` (`content`\|`dirty-tree`), `paths`, `snapshot` |
+| `run.resume` | `from_step`, `resolutions` |
 | `lead.message` | `text` (verbatim) |
 | `router.decision` | `expert`, `reason`, `scores`, `mode` |
 | `router.override` | `from`, `to`, `source` (`flag`\|`prompt`) |
@@ -138,6 +150,10 @@ events — `run_id`.
 | `tool.invoke` | `tool`, `args_hash`, `args` (redacted), `cwd`, `timeout_ms` |
 | `tool.result` | `status`, `exit_code`, `duration_ms`, `bytes_out`, `truncated`, `artifact` |
 | `vm.start` / `vm.stop` / `vm.health` | `accel`, `cpus`, `memory_mb`, `image_sha256`, `boot_ms` |
+| `vm.recover` | `discarded_commits`, `recloned_at`, `fsck` |
+| `accel.override` | `flags`, `state`, `result` |
+| `setup.firewall` | `action` (`create`\|`replace`\|`remove`), `program`, `rule` |
+| `image.rebuild` | `old_sha256`, `new_sha256`, `builder` |
 | `egress.request` | `tool`, `method`, `host`, `path_prefix`, `bytes_out`, `bytes_in`, `outcome` |
 | `egress.deny` | `tool`, `host`, `policy`, `reason` |
 | `sync.start` / `sync.end` / `sync.conflict` | see `docs/sync.md` §7 |
@@ -163,11 +179,11 @@ Every check prints `ok` / `warn` / `fail` with the value it observed and a one-l
 |---|---|
 | Host | Windows build ≥ 10.0.19041 · x64 · RAM total · free disk on `state` and `workspace` volumes · long paths enabled |
 | Hypervisor | WHPX feature enabled · probe boot result · recorded accel vs current · **no fallback exists, so this is a hard check** |
-| Image | file exists · sha256 matches config · overlay present/absent · base kernel = expected |
-| Tools | qemu version = pinned · git present and version |
-| Egress | firewall rule present and per-executable · proxy can bind its ports · allowlist parses |
-| Keys | key store ACL is owner-only · no key material inside the guest image |
-| External | `llama.base_url` answers `/v1/models` · `nine_router.base_url` answers with the client key · version matches `expect_version` · served model matches the manifest |
+| Image | file exists · sha256 matches config · overlay present/absent · base kernel = expected · ssh host key fingerprint matches the one recorded with that sha256 · `image.rebuild` history is consistent with the pin |
+| Tools | qemu version = pinned · git present and version · NixOS-WSL present only if the image will be rebuilt (`D-025`) |
+| Egress | rule `bothea-qemu-egress` present and scoped to the configured `qemu.exe` · proxy can bind its ports · allowlist parses · no provider host appears in it (`D-028`) |
+| Keys | key store ACL is owner-only · seed ISO ACL is owner-only · no key material inside the guest image |
+| External | `llama.base_url` answers `/v1/models` and `/props` · served model and `n_ctx` match the manifest · `nine_router.base_url` answers with the client key · 9router version recorded and compared with the last run |
 | Repo | `.gitattributes` has `* -text` · `core.*` flags match §6 of `docs/sync.md` · no models/state tracked · case collisions absent |
 | Guest | broker protocol version matches core · tools.lock.json nar hashes resolve |
 | Plugins | every `[permissions]` value is in the enum · every host cap actually applied is reported · manifest hash matches the approved install |
@@ -180,9 +196,19 @@ that silently stops matching is worse than no scanner (M-3).
 ## 5. Runbooks
 
 **A sync conflict appears mid-run.**
-Read the paths and hunks. `--resolve <path>=host|guest|both` per path, then `bothea sync`
-again. If unsure: `both` keeps everything; nothing is lost while deciding. To undo a completed
-merge: `bothea sync --restore <snapshot>`.
+The run is `blocked`, not failed: the guest's branch, the snapshot, and the conflict record all
+survive. Read the paths and hunks. `--resolve <path>=host|guest|both` per path, then
+`bothea run --continue <run_id>`, which resumes at the step after the one that conflicted. If
+the record says `dirty-tree`, there is nothing to resolve — commit or stash the named paths and
+continue. If unsure: `both` keeps everything; nothing is lost while deciding. To undo a
+completed merge: `bothea sync --restore <snapshot>`.
+
+**The host rebooted, or the guest was killed mid-run.**
+Nothing to repair by hand. `bothea vm start` sees the stale `state/vm.session` marker, keeps
+the overlay so installed tools survive, fsck's it, and re-clones the working copy from the host
+bundle; commits the host never received are discarded and the count is in `vm.recover`. If the
+message says fsck failed, run `bothea vm reset`. Do not try to rescue `~/work` — it is
+rebuildable by definition.
 
 **The VM won't start.**
 `bothea doctor` first. Then `bothea vm logs` for the serial console. Then `bothea vm reset` —
@@ -190,6 +216,11 @@ which costs a tool reinstall and nothing else. If the message is about egress en
 is a refusal by design: fix the firewall rule rather than bypassing it. If it says WHPX is
 unavailable, there is no fallback to reach for (`D-016`) — that is K-1, and it is an
 architecture conversation, not a troubleshooting step.
+
+**The VM refuses to start after a QEMU upgrade.**
+The firewall rule is scoped to the QEMU executable path, so an upgrade makes it stale. That is
+a refusal, not a bypass: run `bothea setup --elevate` once and start again (`D-024`). A tool
+that offered to "skip the check" would be offering an unenforced sandbox.
 
 **An expert won't answer.**
 Bothea does not own llama-server or 9router (`D-009`, `D-021`), so the first move is always

@@ -1,6 +1,6 @@
 # Bothea v2 — Product Requirements Document
 
-**Status:** draft for approval · **Version:** 0.1 · **Owner:** the lead · **Date:** 2026-11-18
+**Status:** specification · decisions ratified 2026-11-18 (`D-030`) · **Version:** 0.2 · **Owner:** the lead · **Date:** 2026-11-18
 
 ---
 
@@ -33,7 +33,8 @@ time and safety, not in favour of generality.
 - **G2** — No change, on either side, becomes unrecoverable.
 - **G3** — Every byte leaving the machine is attributable to a logged request.
 - **G4** — The lead always knows which expert is answering and why, and can override it.
-- **G5** — The system idles cheap: nothing loaded that is not in use.
+- **G5** — Bothea idles cheap: nothing of Bothea's stays resident when idle, and the models the
+  lead runs are reported rather than silently loaded or evicted (`D-021`).
 
 ## 4. Non-goals
 
@@ -65,9 +66,10 @@ answer and a log entry.
 calls a shell tool in the VM, edits two files, runs a test, reports. The lead sees the
 transcript, the diff, and the usage. No credential appeared in the VM.
 
-**J3 — Concurrent edit (M3).** The lead edits `src/lib.rs` while the VM edits `README.md`.
-Sync merges both without a prompt. Then both edit `src/lib.rs`: sync stops, shows both
-hunks, and applies the lead's choice only.
+**J3 — Concurrent edit (M3).** The lead edits and commits `src/lib.rs` while the VM edits
+`README.md`. The next step-boundary sync merges both without a prompt. Then both change
+`src/lib.rs`: the run stops `blocked`, shows both hunks, and applies the lead's choice only
+before `--continue` resumes it.
 
 **J4 — Recovery (M3).** The lead deletes a directory they meant to keep, then runs
 `bothea sync --restore <snapshot>`. The directory returns. Nothing was pushed anywhere.
@@ -77,7 +79,8 @@ installs it inside the VM through the proxy, records the nixpkgs revision and ou
 a lockfile, and the tool becomes callable. The host gained a manifest and nothing executable.
 
 **J6 — Bad request (M2/M5).** The lead asks for something that needs 2 GB more RAM than is
-free. Bothea refuses with the arithmetic and does not start a model.
+free. Bothea refuses to route to that expert, prints the arithmetic, and starts nothing — the
+model process is the lead's anyway (`D-021`).
 
 ## 7. Functional requirements
 
@@ -111,13 +114,16 @@ free. Bothea refuses with the arithmetic and does not start a model.
 - **FR-V3** The core MUST verify, before accepting a guest session, that (a) the guest can
   reach the egress proxy and (b) the guest cannot reach a non-allowlisted destination.
   Failure is a hard start failure, not a warning.
-- **FR-V4** The core MUST compute a resource budget from host totals and currently resident
-  processes, and MUST refuse configurations that exceed available RAM or CPU.
+- **FR-V4** The core MUST compute a resource budget from host totals and currently available
+  memory, and MUST refuse configurations that exceed available RAM or CPU.
 - **FR-V5** The core MUST NOT pass a host filesystem share into the guest.
 - **FR-V6** The core MUST guarantee no orphan QEMU process outlives the core.
 - **FR-V7** The VM MUST NOT contain any credential material. *(Acceptance: a secret scan of
   the guest image and the guest filesystem finds no key material; `doctor` re-runs the scan
   against the configured key store to prove the scan works.)*
+- **FR-V8** The core MUST NOT create or modify the host firewall rule during a start. The rule
+  is created by an explicit elevated setup action and verified on every start; a missing,
+  stale, or wrongly scoped rule is a refusal (`D-024`).
 
 ### Transport
 
@@ -151,6 +157,11 @@ free. Bothea refuses with the arithmetic and does not start a model.
   crash costs at most one step.
 - **FR-S9** Sync MUST be byte-preserving across Windows and Linux: no line-ending or
   file-mode reinterpretation may appear as a change.
+- **FR-S10** Sync MUST run after every completed step by default (`sync.when = per_step`,
+  `D-022`), MUST NOT require a clean host tree, and MUST stop the run in state `blocked` —
+  not `failed` — when a merge conflicts or when git refuses because of uncommitted local
+  changes. Only commits are visible to the guest; uncommitted host edits are neither synced nor
+  silently discarded.
 
 ### Plugins and tools
 
@@ -221,8 +232,10 @@ free. Bothea refuses with the arithmetic and does not start a model.
 
 - **NFR-1 Idle cost**: with no run active and no expert loaded, resident cost of the core
   MUST be under 200 MB and the VM MUST be stoppable to zero.
-- **NFR-2 Start budget**: on a WHPX-capable host, guest healthy within 60 s of cold start;
-  expert loaded within 30 s of a warm model cache.
+- **NFR-2 Start budget**: on a WHPX-capable host, guest healthy within 60 s of cold start. An
+  expert endpoint that is already serving MUST be accepted within 2 s; one that is not MUST be
+  refused with the endpoint and the last error rather than waited on. Bothea does not load
+  models (`D-021`), so model load time is not a Bothea metric.
 - **NFR-3 Recovery**: any sync-related mistake MUST be reversible in under 2 minutes using
   documented commands only.
 - **NFR-4 Auditability**: no state change without a log line; no log line without a `seq`.
@@ -240,8 +253,9 @@ The sample size is one, so these are falsifiable checks rather than statistics.
 - **M-1** J2 completes end to end without the lead touching git by hand.
 - **M-2** A deliberately bad sync is undone in under 2 minutes (timed, on the real machine).
 - **M-3** Secret scan of the guest is clean, and the same scan catches a planted canary.
-- **M-4** The egress test suite (allowed host, blocked host, UDP, DNS, raw IP) passes on
-  every VM start.
+- **M-4** The egress test suite — all six probes in `docs/vm.md` §6: proxy TCP, allowlisted
+  HTTPS, non-allowlisted refusal, raw-IP HTTPS, off-proxy DNS, UDP/53 — passes on every VM
+  start.
 - **M-5** Idle: core under 200 MB, VM stopped, no model resident.
 
 ## 10. Kill criteria
@@ -253,9 +267,10 @@ These exist so the project can stop on evidence rather than on mood.
   fallback (`D-016`). Stop before M2 and choose the pivot deliberately, with the S1 numbers in
   hand: WSL2 with a restricted mount, a host-only sandboxed folder, or deferral. Do not proceed
   on the assumption that a fallback will appear.
-- **K-2** If after the first end-to-end slice (M5) a representative task takes more than 1.5×
-  the wall-clock of doing the same task with Claude Code in a plain folder — and the gap is
-  not explained by a control the lead actually values — stop and reassess the VM tax.
+- **K-2** **Hard stop-gate** (`D-029`). If after the first end-to-end slice (M5) a representative
+  task takes more than 1.5× the wall-clock of doing the same task with Claude Code in a plain
+  folder — and the gap is not explained by a control the lead actually values — stop and
+  reassess the VM tax before M6.
 - **K-3** If the Claude Code plugin's compliance basis cannot be established, that plugin is
   not written. This does **not** stop the product: the expert path never depended on it
   (`D-013`).
@@ -268,17 +283,21 @@ is built on them.
 ### S1 — VM spike (no product code)
 
 Prove: WHPX boot of a NixOS qcow2, headless serial console, SSH over a host-forwarded port,
-egress blocked, proxy reachable.
+egress blocked, proxy reachable. The harness is `spike/s1/` — a launch script, the six probes,
+and a boot-time recorder — committed as evidence, not as product (`D-025`). It needs one thing
+that is not code: a qcow2 from `scripts/build-image.sh`, built inside NixOS-WSL.
 **Exit:** WHPX boot time recorded (the only supported accelerator); the six egress probes
 behave correctly; `-machine q35 -accel whpx,kernel-irqchip=off` is the recorded working
-combination. If this exit cannot be met, K-1 fires.
+combination; the accelerator probe from `docs/vm.md` §2 distinguishes `whpx` from
+`whpx-present` and `whpx-missing`. If this exit cannot be met, K-1 fires.
 
 ### S2 — Sync spike (no product code)
 
 Prove: two host folders, the Windows/Linux hygiene flags, bundles instead of remotes, and the
 fixture matrix in `docs/sync.md` §8.
-**Exit:** fixture suite green including add/add, delete/modify, rename/modify, binary, CRLF,
-and case-only rename; a 200-file round trip produces zero spurious diffs.
+**Exit:** fixture suite green — cases 1–16 directly, 17–19 through a scripted step driver —
+including add/add, delete/modify, rename/modify, binary, CRLF, case-only rename, and the
+`blocked` / `dirty-tree` behaviour; a 200-file round trip produces zero spurious diffs.
 
 ### M1 — Host core
 
@@ -289,20 +308,23 @@ reconstructs a synthetic run.
 ### M2 — VM lifecycle
 
 Start/stop/health/reset, acceleration policy, resource guard, orphan prevention, serial log,
-control channel, egress verification.
-**Exit:** FR-V1..V7, FR-T1; 20 consecutive start/stop cycles with no orphan; refusal messages
-carry numbers; `vm reset` returns a working guest from the base image.
+control channel, egress verification, unclean-shutdown recovery.
+**Exit:** FR-V1..V8, FR-T1; 20 consecutive start/stop cycles with no orphan; a killed core is
+recovered without a reinstall (overlay kept, working copy re-cloned); refusal messages carry
+numbers; `vm reset` returns a working guest from the base image.
 
 ### M3 — Sync
 
-Snapshot refs, bundles, merge, conflict UX, sync log, retention.
-**Exit:** FR-S1..S9 plus J3 and J4 on the real machine; killing the core mid-sync leaves the
-host repository clean and re-runnable.
+Snapshot refs, bundles, merge, conflict UX, sync log, retention, per-step sync.
+**Exit:** FR-S1..S10 plus J3 and J4 on the real machine; killing the core mid-sync leaves the
+host repository clean and re-runnable; a conflict mid-run parks the run in `blocked` and
+`--continue` resumes it after resolution.
 
 ### M4 — Plugins and tools
 
-**Entry:** the lead has explicitly confirmed the per-plugin permission model (D-005). It
-changes how every plugin is written, so it is a gate rather than an assumption.
+**Entry:** satisfied — the per-plugin permission model was ratified by the lead on 2026-11-18
+(`D-030`, closing `D-005`). It changes how every plugin is written, which is why it was a gate
+rather than an assumption.
 
 Protocol, broker, install model, first tool set (search, file read/write/patch, shell).
 **Exit:** FR-P1..P4, FR-T2, J5; 100 sequential invocations with no fd/process leak; a 4 MiB
@@ -332,7 +354,7 @@ is recorded first (`D-013`).
 | Risk | Impact | Mitigation | Verified by |
 |---|---|---|---|
 | WHPX unusable on the host | **K-1 hard stop-gate**; no fallback exists | S1 before any product code; record the flag combination or stop | S1 |
-| Nix on Windows can't build the guest image | M2 blocked | Build in CI or WSL2; pin and publish the artifact | S1 |
+| Nix on Windows can't build the guest image | M2 blocked | Committed flake built inside NixOS-WSL; the hash is recorded per build (`D-025`) | S1 |
 | Windows↔Linux git noise masquerades as edits | Sync unusable | `-text` attributes, no autocrlf, no filemode, preflight collision scan | S2 |
 | Egress enforcement leaks through host loopback | Key exfiltration | Per-executable firewall rule, loopback-only listeners, per-session tokens | S1 gate |
 | 9router advisories or its optional tunnel features | Host compromise | External app: Bothea prints the hardening checklist and verifies only the endpoint; the lead pins the version and disables tunnel/cloud/MITM | M5 |
@@ -340,5 +362,6 @@ is recorded first (`D-013`).
 | Bothea quietly grows lifecycle duties for external services | The boundary erodes; a crash takes down more than it should | FR-E7 and D-021: health-check only, never spawn or kill | M5 |
 | Agent edits and lead edits collide constantly | G2 violated | One collapsed working tree; per-step VM commits; snapshot refs | M3 |
 | Sync tax exceeds its value | K-2 fires | Measure at M5 with a real task | M5 |
-| Permission model changes how plugins are written | M4 slips, plugins rewritten | Confirmation gate before M4; manifests are small and mechanical | M4 |
+| Permission model changes how plugins are written | M4 slips, plugins rewritten | Ratified before M4 (`D-030`); manifests are small and mechanical | closed |
+| Per-step sync puts a merge on every step's critical path | Long runs feel slower than the work they do | Measured at M5 (K-2); `end_of_run` and `manual` are the escape hatches (`D-022`) | M5 |
 | Scope creep into a general framework | Never ships | N1–N6 are contractual; new plugin kinds require a decision record | every review |

@@ -59,8 +59,8 @@ cannot verify it.
 
 ## D-005 — smart/yolo removed; policy is declared per plugin, capped by the host
 
-**Status:** accepted; **explicit lead confirmation required before M4** (it changes how every
-plugin is written — see §11 of `PRD.md`).
+**Status:** accepted; **ratified by the lead on 2026-11-18** (`D-030`), which closes the M4
+entry gate (it changes how every plugin is written — see §11 of `PRD.md`).
 **Decision:** no global modes. Five action types (`read`, `write`, `delete`, `network`,
 `shell`), three values (`allow`, `ask`, `deny`). Each plugin declares its policy per action
 type in `[permissions]`; a missing type is `deny`. The host holds a ceiling per type, and the
@@ -140,7 +140,9 @@ The lead owns: pinned version and recorded commit; loopback bind; `REQUIRE_API_K
 9router's own request log off.
 **Why:** an application Bothea does not own cannot be configured by Bothea. Pretending
 otherwise would produce a false sense of enforcement. What Bothea *can* do is refuse to use an
-endpoint that does not answer with the client key, and report a version it did not expect.
+endpoint that does not answer with the client key, and report a version that changed since the
+last run rather than one it "expected" (`docs/models.md` §3 explains why the version is not a
+config value).
 **Cost:** a checklist that can be ignored. Mitigated by `doctor` failing when the endpoint
 answers without a key.
 
@@ -169,7 +171,7 @@ That is a feature.
 ## D-013 — Claude Code is a plugin tool, deferred until after M3
 
 **Status:** accepted. Removed from the core roadmap.
-**Decision:** Claude Code is a plugin tool. It is not part of M0–M3, and no core work depends
+**Decision:** Claude Code is a plugin tool. It is not part of S1–M3, and no core work depends
 on it beyond the generic tool plugin mechanism from M4. When the plugin is authored it must
 authenticate with an API key — a subscription login relayed through the proxy is not an
 acceptable implementation (`D-011`) — and it must record its compliance basis first.
@@ -289,6 +291,150 @@ to start the model they want.
 
 ---
 
+## D-022 — Sync runs at every step boundary, and a conflict stops the run
+
+**Status:** accepted. Answers "when does sync run", which `docs/sync.md` §4 described without
+saying.
+**Decision:** `sync.when = "per_step"` is the default. At the end of each completed step the
+guest commits (`FR-S8`), the core pulls, merges with `--no-ff`, and pushes the merge result
+back so the next step reads the merged tree. A step that committed nothing produces no sync.
+If the merge conflicts, the run enters `blocked`, the conflict record is written, and the loop
+stops; `bothea run --continue` resumes at the next step once the lead has resolved it.
+`end_of_run` and `manual` exist for long mechanical runs and are documented with their cost.
+Two consequences are stated rather than discovered:
+- **Only commits are synced.** Uncommitted edits in the lead's tree never reach the guest;
+  `bothea run` prints the count of dirty paths and says so.
+- **A dirty tree is not a precondition.** The merge proceeds when git allows it (the common
+  case: the lead is editing a file the guest did not touch). When git refuses because of local
+  changes, that is recorded as a `dirty-tree` conflict — a different kind from a content
+  conflict, with a different remedy (commit or stash the named paths, then continue).
+**Why:** the conflict surface grows with divergence. Catching a collision at step 2 costs two
+steps; catching it at step 20 means ten steps were built on a file that no longer matches the
+host. Per-step sync also makes the host tree the current best answer at every moment, which is
+what G2 ("nothing unrecoverable") actually requires.
+**Cost:** up to one merge commit per step, and a merge on every step's critical path. Measured
+at M5 (K-2); `end_of_run` is the escape hatch if the measurement says so.
+
+## D-023 — After an unclean shutdown the guest working copy is rebuilt, never trusted
+
+**Status:** accepted.
+**Decision:** the core writes `state/vm.session` on start and clears it on a clean stop. A start
+that finds a stale marker treats the previous session as unclean:
+1. boot the existing overlay, so installed tools survive, and let the guest fsck its root
+   (NixOS does this at boot);
+2. delete `~/work` and re-clone from the host bundle — the guest working copy is disposable;
+3. keep `agent/<run>` only up to the last commit the host actually received; anything newer is
+   discarded, because a half-applied step is not detectable and not worth guessing about;
+4. log `vm.recover` with what was discarded.
+If fsck fails, the message names `bothea vm reset` rather than pretending a repair is possible.
+`vm reset` refuses while a run is active.
+**Why:** the overlay is the only state that survives a crash, and it is also the only state whose
+contents are unknown after one. The trust anchors are the host repository and `tools.lock.json`,
+which are on the host and verified by hash. Anything that cannot be verified against them is
+rebuilt, and rebuilding a clone takes seconds while reconstructing a half-applied step takes an
+afternoon.
+**Cost:** a crash loses the uncommitted tail of the current step (already the FR-S8 bound) and
+costs a re-clone. Installed tools are not lost, so the expensive part is preserved.
+
+## D-024 — The firewall rule is created once by `bothea setup`, verified on every start
+
+**Status:** accepted.
+**Decision:** `bothea setup --elevate` creates the outbound rule `bothea-qemu-egress`, scoped to
+the resolved QEMU executable path, replacing any older rule with that name, and records the path
+in `state/pins.json`. `bothea vm start` verifies the rule exists, is scoped to the same program
+path, and blocks outbound; it never creates or edits a rule, and a missing or stale rule is a
+refusal with the exact command to run. Uninstall removes the rule (M6 exit criterion).
+**Why:** creating the rule at start means a UAC prompt inside `bothea run`, which is both a
+worse experience and a prompt the lead will learn to approve blindly. Creating it once, at an
+explicit setup step, keeps the privileged action visible and separate from the work. Verifying
+at every start keeps the guarantee: an unenforced sandbox never starts (`FR-V3`).
+**Cost:** one elevated step at install, and a refusal after a QEMU upgrade until `setup` is
+re-run — deliberate, because a silently stale rule is an unenforced sandbox.
+
+## D-025 — The guest image is built from a committed flake inside NixOS-WSL
+
+**Status:** accepted. Replaces "CI preferred, WSL2 fallback", which named no builder that
+exists.
+**Decision:** the flake and `scripts/build-image.sh` are committed. The script runs inside a
+NixOS-WSL instance, builds the qcow2, copies it to the images directory, and prints the sha256,
+which is recorded in `state/pins.json` and `bothea.toml`. CI is optional and, if added later, is
+treated as a different builder: a rebuild records a new hash as `image.rebuild`, never a silent
+replacement of the artifact behind an unchanged hash. The S1 harness lives in `spike/s1/`,
+committed and marked non-product, because it is the evidence for K-1 and has to be re-runnable.
+**Why:** no CI pipeline exists, and blocking M2 on infrastructure that does not exist is a
+schedule hole disguised as a preference. The hash is what makes provenance checkable regardless
+of who built the image; the builder is an implementation detail. A qcow2 is not byte-reproducible
+(embedded timestamps), so honesty means "same inputs, new recorded hash", not "same bytes".
+**Cost:** the lead needs a working NixOS-WSL install before S1 can finish, and rebuilds produce
+new hashes that must be recorded.
+
+## D-026 — Guest SSH access is provisioned by a seed ISO, never baked into the image
+
+**Status:** accepted. Resolves the "baked in at build time … or better: injected on first start"
+hedge in `docs/vm.md` §7.
+**Decision:** `bothea init` generates the ed25519 keypair and a NoCloud cloud-init ISO carrying
+the public key. QEMU attaches that ISO read-only at every boot; cloud-init installs
+`authorized_keys` on the first boot of an overlay. The base image carries no key, and the ISO
+lives in `state/` and is never synced.
+**Why:** baking the key means the image must be rebuilt whenever the key rotates, and it puts a
+host-specific identifier into an artifact that is meant to be distributable. A read-only block
+device is not a filesystem share, so it does not violate `FR-V5`.
+**Cost:** one extra read-only drive, and cloud-init in the base image.
+
+## D-027 — The default local expert is 7B-class at Q4_K_M; hashes are recorded, not asserted
+
+**Status:** accepted.
+**Decision:** the example expert manifest points at a 7B-class coder GGUF at Q4_K_M (~4.5 GB,
+8k context), for example Qwen2.5-Coder-7B-Instruct. Its sha256 is filled in from the download at
+install time and is never written into the docs. `router.model` (the tie-break model) defaults
+to a 1.5–2B class model, not the default expert. The 30B example is removed: a 30B Q4_K_M does
+not fit a 16 GB host with a 4 GB VM, and a default that cannot run on the machine this spec is
+written for is a trap.
+**Why:** the sizing section and the plugin example disagreed, and the example was the one that
+would fail first. Picking a model that fits the budget makes the first run succeed, which is
+what M5's exit criterion needs.
+**Cost:** none; the manifest is editable and the hash is the pin.
+
+## D-028 — The guest reaches the model gateway, never a provider host
+
+**Status:** accepted.
+**Decision:** `[egress] allow` lists only direct destinations the guest genuinely needs
+(package cache, Nix channels). API-model traffic targets `nine_router.proxy_host`, a synthetic
+name the proxy maps to `nine_router.base_url`. Provider hosts (`api.openai.com`,
+`api.anthropic.com`, …) MUST NOT appear in the guest-visible allowlist, and a config containing
+one is a validation error.
+**Why:** with 9router as the gateway, a guest request to a provider host has nowhere to go — the
+provider key lives in 9router, and the proxy does not hold one. Listing provider hosts made the
+topology look like the proxy talks to providers directly, which contradicts `D-009` and would
+mislead the next person to read the config. It also invited an allowlist entry that could only
+ever hide a leak.
+**Cost:** none; the mapping makes the topology honest and removes an entry nobody could use.
+
+## D-029 — K-2 is binding, like K-1
+
+**Status:** accepted.
+**Decision:** K-2 is a stop-gate, not a warning. It is measured at M5 with one representative
+task done both ways, both wall clocks recorded in the session log, and the 1.5× rule plus the
+"explained by a control the lead actually values" exception applied as written. If it fires, M6
+does not start until the tax is reduced or the project is reassessed.
+**Why:** a kill criterion that is only advisory is a wish with a table around it. K-1 was
+settled as a hard gate; leaving K-2 softer would mean the one measurement that can invalidate
+the VM tax is the one nobody is obliged to look at.
+**Cost:** one task gets timeboxed and measured. That is the cheapest possible insurance.
+
+## D-030 — The per-plugin permission model is ratified (closes D-005)
+
+**Status:** accepted by the lead on 2026-11-18. **This closes the M4 entry gate.**
+**Decision:** five action types (`read`, `write`, `delete`, `network`, `shell`), three values
+(`allow`, `ask`, `deny`), declared per plugin in `[permissions]`, absent means `deny`, the host
+holds a ceiling per type, the effective policy is the stricter of the two, `write_outside_workspace`
+is always `deny` and is not a declarable key, and a merge conflict is not an action type at all.
+**Why ratification was a gate:** the model changes how every plugin is written, and retrofitting
+it after M4 would mean rewriting manifests and re-approving every install.
+**Cost:** already accounted for in `docs/permissions.md`; changing a declaration is a re-install.
+
+---
+
 ## Mapping from the rev-2 draft
 
 | Rev-2 item | Resolution |
@@ -305,5 +451,12 @@ to start the model they want.
 | (unstated) host↔guest transport | D-002 |
 | (unstated) image provenance | `docs/vm.md` §3, D-017 |
 | (unstated) llama-server ownership | D-021 — lead runs it; Bothea checks `/health` |
+| (unstated) when sync runs during a task | D-022 — per step; a conflict blocks the run |
+| (unstated) unclean guest shutdown | D-023 — overlay kept, working copy rebuilt |
+| (unstated) firewall rule lifecycle | D-024 — created once by `bothea setup`, verified every start |
+| (unstated) image build path | D-025 — committed flake in NixOS-WSL; hash is the contract |
+| (unstated) guest ssh provisioning | D-026 — cloud-init seed ISO; no key in the image |
+| (unstated) default local model | D-027 — 7B-class Q4_K_M; hashes recorded, not asserted |
+| (unstated) guest reachability of providers | D-028 — gateway only; provider hosts rejected in config |
 | (unstated) task loop bounding | `docs/architecture.md` §5, FR-C5/C6 |
-| (unstated) crash recovery | `docs/architecture.md` §8, FR-S8 |
+| (unstated) crash recovery | `docs/architecture.md` §8, FR-S8, D-023 |

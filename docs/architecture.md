@@ -64,8 +64,8 @@ responsibility ends at "is it answering", not at "is it running" (`D-021`).
   TRUSTED                      SEMI-TRUSTED                UNTRUSTED CODE
   ---------                    ------------                -------------
   core, key store       ->     9router, proxy,      ->     guest: broker, tools,
-  host git repo, log           llama-server                Claude Code, AI output,
-  QEMU process                                                 anything it writes
+  host git repo, log           llama-server                installed programs, AI output,
+  QEMU process                                             anything it writes
 ```
 
 - The core and the key store are trusted. Everything the core writes (repo, log) is the
@@ -120,7 +120,10 @@ run(request, budget):
           result = vm.invoke(call)                   # FR-T2, over the broker
           log(tool.result, call, result.summary)
           context.append(result)
-      expert = expert                              # stays the same (FR-E5)
+      guest.commit("step " + step)                   # FR-S8: crash costs at most one step
+      sync()                                         # D-022: pull, merge, push back
+                                                     # conflict -> BLOCKED, never auto-resolved
+      # expert unchanged for the run (FR-E5); reassignment is a lead action
   stop(REASON_STEPS)
 ```
 
@@ -134,6 +137,11 @@ Design notes worth stating explicitly, because they are easy to get wrong:
   no self-extension. Only the lead continues a run.
 - **The loop is in the core, not in a prompt.** No expert is trusted to terminate its own
   loop.
+- **Sync is inside the loop, not around it.** The step's commit and merge happen before the
+  next expert call, so a conflict stops the run at the step that caused it rather than after
+  ten more steps were built on a stale file (`D-022`).
+- **`blocked` is a third terminal state.** `ok`, `failed`, and `budget` end a run; `blocked`
+  parks it until the lead resolves a conflict, and `--continue` resumes at the next step.
 - **`route()` respects the default.** With routing disabled (`D-007`), it returns the lead's
   `--expert` or prompts with the candidate list; it never guesses.
 
@@ -142,7 +150,8 @@ Design notes worth stating explicitly, because they are easy to get wrong:
 | State | Location | Owner | Lost if... |
 |---|---|---|---|
 | Lead's work | host working tree | lead + core | never (git + snapshot refs) |
-| AI's work | guest clone, `agent/<run>` | core (commits per step) | VM crash → at most one step |
+| AI's work, uncommitted | guest working tree | core | VM crash → at most one step |
+| AI's work, synced | host `main` (merge commit) | core | never (merged after every step) |
 | Run transcript | session log, `state/logs/` | core | disk failure |
 | Installed tools | guest image overlay | core | `vm reset` (rebuild from manifest lockfile) |
 | Credentials | key store + 9router SQLite | lead | never syncs, never backs up via Bothea |
@@ -161,9 +170,10 @@ browser session (out of scope, but adjacent).
   reset.
 - *A2 — A malicious or compromised tool package.* Mitigated by: pinned nixpkgs revision and
   output hash, unprivileged user, resource limits, scoped (not master) egress token.
-- *A3 — A compromised 9router or llama-server.* Mitigated by: loopback binding, per-session
-  API keys, the fact that neither holds the lead's other credentials, and the proxy being the
-  only path a guest token can travel.
+- *A3 — A compromised 9router or llama-server.* Mitigated by: loopback binding, an API key on
+  each (Bothea's client key for 9router, the lead's own `--api-key` for llama-server, which
+  Bothea sends from its store), the fact that neither holds the lead's other credentials, and
+  the proxy being the only path a guest token can travel.
 - *A4 — Prompt injection inside fetched content* (a web page, a repo file, a tool's output).
   Mitigated by: the permission engine being outside the model, egress being allowlisted, and
   shell actions being logged and reviewable. **Not** mitigated by trusting the model to
@@ -177,9 +187,10 @@ guardrail.
 
 | Crash point | Consequence | Recovery |
 |---|---|---|
-| Core dies during a tool call | Guest may have applied the effect; unknown outcome | Run ends; guest branch is inspected before reuse (FR-T3: no silent retry) |
-| Core dies mid-sync | Host repo may be mid-merge | On next start, `sync` detects an in-progress merge and offers `--abort` or `--resolve`; snapshots are intact |
+| Core dies during a tool call | Guest may have applied the effect; outcome unknown | Run ends `failed` (FR-T3); on the next VM start the working copy is re-cloned and unreceived commits are discarded (`D-023`) |
+| Core dies mid-sync | Host repo may be mid-merge | Next start finds the in-progress merge and offers `--abort` or `--resolve`; snapshots are intact |
 | VM dies mid-step | Uncommitted guest work lost | Guest commits per step (FR-S8); at most one step lost |
+| Host reboots or is hard-killed mid-run | QEMU dies with the Job Object; overlay left dirty | `state/vm.session` is stale, so the next start keeps the overlay (tools survive) and rebuilds the working copy |
 | Host repo corrupted | Lead's work at risk | Snapshot refs contain the pre-sync tree; restore is a documented command |
 | Log truncated | Audit gap | Rotation is tail-safe (FR-O3); the last complete line wins |
 
@@ -192,8 +203,8 @@ Every one of these is recorded at first use and checked by `doctor`:
 | QEMU | version string + hash of the binary |
 | Guest image | sha256 of the base qcow2 |
 | nixpkgs | git revision used for tool installs (per lockfile entry) |
-| 9router | package version + commit |
-| llama-server | version + build flags |
+| 9router | version string from its API; commit recorded by the lead when pinning |
+| llama-server | version string from `/props` when it reports one; recorded as `unavailable` otherwise |
 | GGUF | repo id, filename, sha256, license |
 | Config | schema version + the effective resolved config, logged per run |
 

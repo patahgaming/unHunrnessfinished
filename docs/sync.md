@@ -24,6 +24,8 @@ hygiene needed to cross an OS boundary without inventing phantom changes.
 - The guest never touches `main`. It works on `agent/<run>`.
 - The core is the only merger, and the only writer on the host (I1).
 - The guest cannot push. It can only make commits locally; the core pulls them.
+- The core pulls and merges **after every completed step**, not only at the end of a run
+  (`D-022`), so the host tree is never more than one step behind what the AI believes.
 
 ## 2. Snapshots
 
@@ -54,6 +56,11 @@ Properties that matter:
 
 **Before every merge**, the core takes a snapshot and logs `snapshot.create` with the ref.
 **Before `vm reset`, before `--restore`, and before the first sync of a session**, likewise.
+
+With per-step sync (`D-022`) that means up to one snapshot per step. That is intentional and
+cheap: snapshot trees share blobs with everything already in the object store, so twenty steps
+of small edits add tree objects, not twenty copies of the repository. The refs are what make
+"undo the last three steps" a command instead of an archaeology project.
 
 **Restore:**
 
@@ -91,7 +98,42 @@ core:    stream <- broker.get("/tmp/bothea/out.bundle")
 Bundles are cheap for text workspaces and are atomic by nature: a partial transfer is a
 broken bundle, which git rejects. That is a better failure mode than a half-applied rsync.
 
-## 4. Merge algorithm
+## 4. When sync runs, and how the merge behaves
+
+### When
+
+`sync.when = "per_step"` is the default (`D-022`):
+
+```text
+step ends
+  → guest commits agent/<run>          (FR-S8, the durability bound)
+  → core pulls the bundle
+  → core merges on main                (--no-ff, see below)
+  → core pushes the merge result back  (guest tree is clean here, so this is safe)
+  → next step reads the merged tree
+```
+
+A step that committed nothing produces no sync. `end_of_run` and `manual` exist for long
+mechanical runs; both widen the conflict window, and that is the trade the lead is choosing.
+
+**Only commits are synced.** Uncommitted edits in the host tree never reach the guest — they
+are not in git, and the AI should not build on work the lead has not recorded. `bothea run`
+prints the number of dirty paths at start so this is never a surprise.
+
+**A dirty tree is not a precondition.** Merging into a working tree with unrelated local edits
+is what git is good at, and refusing to start would turn `run` into a commit ritual. When git
+*does* refuse because the merge would overwrite local changes, that is a `dirty-tree` conflict:
+
+| | Content conflict | Dirty-tree conflict |
+|---|---|---|
+| Cause | both sides changed the same path | the merge would overwrite uncommitted host edits |
+| Remedy | per-path `--resolve host\|guest\|both` | commit or stash the named paths, then re-run |
+| Guest's work | needs a decision | needs no decision; it is already merged |
+
+Both stop the run in state `blocked`, and both name the paths. The pre-sync snapshot has already
+captured the dirty state, so nothing is at risk while the lead decides.
+
+### How
 
 ```text
 sync():
@@ -110,6 +152,7 @@ sync():
       git merge --abort                            # leave the tree clean
       write_conflict_record(paths, snap)
       log(result=conflict, paths=[...])
+      run.state = blocked                          # not failed: the lead can resume it
       raise SyncConflict(paths)                    # lead decides
 ```
 
@@ -121,6 +164,9 @@ Deliberate choices:
   state where the lead's next `git` command behaves unexpectedly. The conflict is recorded
   and re-applied when the lead decides.
 - **No retry loop.** A conflicting file is a decision, not a transient error.
+- **`blocked` is not `failed`.** The conflict record, the snapshot, and the guest's branch all
+  survive; `bothea run --continue <run_id>` re-enters the loop at the step after the one that
+  conflicted, with the merged tree as its base.
 
 ## 5. Conflicts
 
@@ -270,5 +316,10 @@ Two folders on one host, no VM. Every case is a test.
 | 14 | 200 files touched, disjoint | 200 files touched, disjoint | zero spurious diffs, single merge commit |
 | 15 | snapshot, then delete whole dir | — | `--restore` returns all files including untracked |
 | 16 | core killed mid-merge | — | next start reports in-progress merge; `--abort` leaves tree clean |
+| 17 | step 1 syncs cleanly, step 2 conflicts | — | run enters `blocked`; after resolve, `--continue` resumes at step 3 |
+| 18 | lead has an unrelated dirty file | modify B | merge proceeds; the dirty file is untouched and still dirty |
+| 19 | lead has an uncommitted edit to the same path | modify A | `dirty-tree` conflict naming the path; commit, re-run, merge completes |
 
-Cases 1–16 are the S2 exit gate. A red case at S2 is cheaper than a red case in M3.
+Cases 1–16 are the S2 exit gate. Cases 17–19 need a scripted step driver rather than the full
+run loop; they are exercised at S2 and re-checked at M3 because they are the per-step sync
+contract (`D-022`).

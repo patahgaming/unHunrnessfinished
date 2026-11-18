@@ -1,7 +1,7 @@
 # Permissions and egress
 
-Requirements FR-SEC1..SEC5. Resolves the rev-2 open question about smart/yolo, and records the
-model that must be confirmed before M4 (`D-005`).
+Requirements FR-SEC1..SEC5. Resolves the rev-2 open question about smart/yolo; the model was
+ratified by the lead on 2026-11-18 (`D-030`, closing `D-005`).
 
 ---
 
@@ -108,10 +108,12 @@ boundary. It should not be, and it is not Bothea's application to begin with.
 
 ```text
   guest tool
-     │  scoped token, host allowlist subset
+     │  scoped token
+     │  target: 9router.internal          (models)
+     │          cache.nixos.org            (packages)
      ▼
   bothea egress proxy        127.0.0.1:18080     ← the boundary lives here
-     │  allowlist check · method check · request log · key injection
+     │  allowlist check · name mapping · request log · key injection
      ▼
   9router  [external app]    127.0.0.1:20128     ← provider gateway, no policy
      │  its own config holds the provider keys
@@ -119,16 +121,34 @@ boundary. It should not be, and it is not Bothea's application to begin with.
   provider (api.openai.com, api.anthropic.com, …)
 ```
 
+**Names, not addresses** (`D-028`). The guest never dials a provider, because it has no
+credential for one and the proxy carries none. Two kinds of allowlist entry exist: direct hosts
+the guest genuinely uses (`cache.nixos.org`, `channels.nixos.org`) and
+`nine_router.proxy_host` — a synthetic name the proxy maps to `nine_router.base_url`. Provider
+hostnames are rejected at config validation, not merely unused: listing one would describe a
+path that cannot work and would make the topology look like the proxy talks to providers
+directly.
+
+From inside the guest the proxy is `10.0.2.2:<proxy_port>`, because QEMU user-mode networking
+maps host loopback to that address; the host-side bind is still `127.0.0.1`. The mapping is a
+slirp detail, and getting it wrong produces a guest that cannot reach the proxy at all — so it
+is written down here rather than rediscovered in a spike (`docs/vm.md` §6).
+
 **Proxy responsibilities.**
 
 - Verify the caller's token and derive its allowlist from the token, not from the request.
-- Match `(method, host, path-prefix)` against the allowlist. Default deny.
+- Match `(method, host, path-prefix)` against the allowlist. Default deny. Resolve
+  `nine_router.proxy_host` to the configured loopback endpoint only after the match.
 - Strip any inbound `Authorization` / `x-api-key` / `cookie`, then inject what the upstream
   needs — the 9router client key for provider calls. The guest's header must never win, in any
   code path, including errors.
 - Log `{run_id, tool, method, host, path_prefix, bytes_out, bytes_in, ms, outcome}` — never a
   body, never a header value.
 - Refuse `CONNECT` to non-allowlisted hosts so a clever tool cannot tunnel.
+- Treat `nine_router.proxy_host` as **plaintext only**. The guest→proxy→9router leg never leaves
+  the machine, so the proxy can terminate the caller's token and inject the client key on that
+  hop; provider TLS starts at 9router, which is the only component holding a provider
+  credential. A plaintext entry for anything else is a config error, not a preference.
 
 **Provider keys are not Bothea's.** They live in 9router's configuration, on the host. Bothea
 holds exactly one 9router credential — the client key — so that the guest's loopback access

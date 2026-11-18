@@ -1,6 +1,6 @@
 # Bothea v2 — documentation set
 
-**Status:** draft for approval. No code exists.
+**Status:** specification complete; execution not started. No code exists.
 **Input:** the rev-2 design draft, plus a gap analysis that filled in transport, image
 provenance, sync mechanics, permissions, and egress enforcement.
 
@@ -21,7 +21,7 @@ This set is the specification. Where it disagrees with the rev-2 draft, this set
 | `docs/permissions.md` | Per-plugin policy declarations, host ceilings, egress allowlist, proxy/9router topology | *the guardrails* |
 | `docs/models.md` | GGUF experts, external llama-server and 9router, routing, the deferred Claude Code plugin | *the intelligence* |
 | `docs/operations.md` | CLI, config schema, session log schema, `doctor`, runbooks | *the daily surface* |
-| `docs/decisions.md` | Decision records D-001…D-019, including the four open questions from the draft | *the reasoning* |
+| `docs/decisions.md` | Decision records D-001…D-030, including every open question the draft left | *the reasoning* |
 
 Reading order for a new reader: `PRD.md` → `architecture.md` → whatever area they own.
 
@@ -39,7 +39,7 @@ Reading order for a new reader: `PRD.md` → `architecture.md` → whatever area
 
 ---
 
-## What is fixed, and what is still the lead's call
+## What is fixed, and what was decided
 
 Fixed by the rev-2 draft (not reopened here):
 
@@ -49,33 +49,55 @@ Fixed by the rev-2 draft (not reopened here):
 - Host enforces sync, keys, and network policy.
 - Deletion inside the workspace is allowed and auto-merges.
 
-Resolved in this set, pending lead sign-off (`docs/decisions.md`):
+Resolved in this set (`docs/decisions.md`):
 
 - D-001 QEMU over WSL2
-- D-005 smart/yolo removed; policy declared per plugin, capped by the host
+- D-005 smart/yolo removed; policy declared per plugin, capped by the host — **ratified
+  2026-11-18 (D-030)**
 - D-007 router off by default until tags are validated
 - D-008 snapshot refs kept forever; large and ignored content pruned at 30 days
 - D-009 9router is an external application, reached over HTTP
+- D-013 Claude Code is a plugin, deferred until after M3
 - D-016 WHPX only; the emulation fallback is deferred, not cancelled
 - D-020 a merge conflict is never resolved without the lead
 - D-021 the lead runs llama-server; Bothea only checks `/health`
-- plus fifteen more structural decisions the rev-2 draft left implicit.
+- D-022 sync runs at every step boundary; a conflict parks the run in `blocked`
+- D-023 after an unclean shutdown the overlay is kept and the working copy is rebuilt
+- D-024 the firewall rule is created once by `bothea setup`, verified on every start
+- D-025 the image is built from a committed flake in NixOS-WSL; the hash is the contract
+- D-026 guest ssh arrives by cloud-init seed ISO; the image carries no key
+- D-027 the default local expert is 7B-class Q4_K_M; GGUF hashes are recorded, not asserted
+- D-028 the guest reaches the model gateway, never a provider host
+- D-029 K-2 is a stop-gate, like K-1
+- D-030 the per-plugin permission model is ratified, closing the M4 entry gate
+- plus twelve more structural decisions the rev-2 draft left implicit.
 
 ---
 
-## Still unanswered
+## Closed on 2026-11-18
 
-Two questions the lead must answer before M1 starts; both have a stated default so work is
-not blocked:
+Every question the earlier draft left open is now a decision rather than a default:
 
-1. **Where is the Milestone 1 design doc?** Rev-2 §1 refers to it as the reference for the
-   host core. It is not in this folder. Default: `M1` in this set is treated as authoritative
-   and the old M1 doc is archived as history (`D-014`).
-2. **Is K-2 also a stop-gate?** K-1 is settled: a hard stop-gate with no fallback (`D-016`).
-   K-2 (the 1.5× sync-tax measurement at M5) is written as a stop-gate too, but has not been
-   confirmed as binding. Default: yes — see `PRD.md` §10.
+| Question | Answer |
+|---|---|
+| Where is the Milestone 1 design doc? | It is not in the folder; this set is authoritative and the draft is archived (`D-014`). |
+| Is K-2 binding? | Yes — a stop-gate like K-1 (`D-029`). |
+| When does sync run during a task? | After every completed step; a conflict parks the run in `blocked` (`D-022`). |
+| What happens to a dirty guest overlay after a crash? | Overlay kept, working copy rebuilt, unreceived commits discarded (`D-023`). |
+| Is the elevated firewall step acceptable at install? | Yes — one elevated `bothea setup`, verified on every start, never created silently (`D-024`). |
+| How is the image built, and where does the spike live? | Committed flake in NixOS-WSL; `spike/s1/` is committed (`D-025`). |
+| How does the guest get an ssh key without one in the image? | cloud-init seed ISO, attached read-only (`D-026`). |
+| Which model ships by default? | 7B-class coder at Q4_K_M; the hash is recorded at install (`D-027`). |
+| Can the guest reach a provider host? | No — only the gateway name; provider hosts are rejected in config (`D-028`). |
+| Is the per-plugin permission model approved? | Yes — ratified, which closes the M4 entry gate (`D-030`). |
 
-Also still open, recorded in `docs/` rather than here: when sync actually runs during a task
-(`docs/sync.md` §4 says how, not when), what happens to a dirty guest overlay after a crash
-(`docs/vm.md` §7), and whether the elevated firewall step at install is acceptable
-(`docs/vm.md` §6, matters for M6).
+## What is left is execution, not specification
+
+- **The S1 result.** WHPX boot has not been measured on the target machine. That is K-1, and it
+  is answered by running `spike/s1/`, not by another document.
+- **The image artifact.** `scripts/build-image.sh` needs one run inside NixOS-WSL to produce the
+  first qcow2 and its hash.
+- **The first GGUF download.** The manifest shape is fixed; the sha256 is recorded when the file
+  is actually downloaded.
+- **9router's pinned version and commit.** Recorded from the repository at install time; the
+  numbers currently quoted in the docs are explicitly marked as unverified.

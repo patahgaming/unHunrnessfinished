@@ -68,6 +68,14 @@ Consequences, stated so nothing is assumed later:
   manifest carries source, sha256, license, and context size. Bothea queries
   `GET /v1/models` and compares what is actually being served against the manifest. A
   mismatch is a refusal with both values printed, not a silent substitution.
+- **Context size is verified too, from `/props`.** `n_ctx` is compared against the manifest's
+  `ctx`; a smaller served context means prompts are silently truncated, so a mismatch is a
+  refusal that prints both numbers. If the endpoint does not report `n_ctx`, Bothea warns once
+  and records that the check was unavailable rather than assuming it passed.
+- **The llama-server key is Bothea's to send, not to set.** If the lead starts the server with
+  `--api-key`, `llama.api_key` in the config points at the same secret, and Bothea sends it on
+  every request. Without it, Bothea would be the one loopback client that skips the key —
+  which is exactly the residual risk `docs/vm.md` §6 is trying to shrink.
 - **No idle unload by Bothea.** The `idle_unload_s` knob is gone; the lead decides when to stop
   a model. G5 ("idle cheap") becomes the lead's policy, and `bothea experts list` reports what
   is currently resident so the decision is informed.
@@ -82,6 +90,25 @@ Consequences, stated so nothing is assumed later:
 Revisit only if manual model management becomes the bottleneck. Option (b) — Bothea starts and
 stops it, with an explicit "not owned" boundary — stays on the table and is recorded as
 deferred, not rejected.
+
+### The default manifest
+
+`D-027` fixes the shape of the shipped example so it fits the machine the spec is written for:
+
+| Field | Default | Why |
+|---|---|---|
+| class | 7B-class instruct/coder model | fits the 16 GB worked example with a 4 GB VM (6.0 GB required) |
+| quantisation | Q4_K_M | 8-bit loses too much quality for the size it costs |
+| `ctx` | 8192 | matches the sizing example; larger contexts change the arithmetic |
+| weights | ≈ 4.5 GB | the number the budget check uses |
+| `sha256` | recorded at install | never asserted in these docs; a doc cannot pin bytes it does not hold |
+| `license` | required | commercial use of output is a real question, answered once |
+
+The example name is Qwen2.5-Coder-7B-Instruct, but the model id is a manifest field, not a
+requirement. `router.model` — the tie-break model — is a small 1.5–2B model, *not* the default
+expert: it exists to break ties, and spending 4.5 GB to do that would defeat the point. The
+earlier 30B example is removed; at Q4_K_M it does not fit a 16 GB host with a 4 GB VM, and a
+default that cannot run is worse than no default.
 
 ## 3. API experts through 9router
 
@@ -102,8 +129,9 @@ or read its database.
   never kills a provider connection, and a 9router restart does not require a VM restart.
   Bothea health-checks the endpoint at VM start and reports, rather than owning a lifecycle it
   does not need (`FR-E7`).
-- **The guest still cannot reach it usefully.** The proxy is the only caller that carries the
-  client key, and 9router must require that key (`REQUIRE_API_KEY`) — otherwise the guest's
+- **The guest still cannot reach it usefully.** Two callers carry the client key: the core, for
+  its own expert calls, and the proxy, for anything a guest tool asks for. The guest itself
+  never holds it — and 9router must require it (`REQUIRE_API_KEY`), otherwise the guest's
   residual loopback access (`docs/vm.md` §6) becomes a way to spend the lead's quota without a
   logged egress record.
 
@@ -118,11 +146,18 @@ or read its database.
 | the client key is not empty | rotation |
 
 **Hardening is the lead's responsibility, and Bothea prints it as a checklist** rather than
-pretending to enforce it (`D-010`): pin the version and record the commit (19 published
-advisories, 6 critical, all fixed by 0.5.6); bind `127.0.0.1:20128` only; `REQUIRE_API_KEY`;
-`INITIAL_PASSWORD` set before first start (the fallback default is `123456`); cloud sync,
-tunnel, MITM bridge and proxy pools off; 9router's own request log off, because Bothea's egress
-log is the record.
+pretending to enforce it (`D-010`): pin the version and record the commit; bind
+`127.0.0.1:20128` only; `REQUIRE_API_KEY`; `INITIAL_PASSWORD` set before first start (the
+fallback default is `123456`); cloud sync, tunnel, MITM bridge and proxy pools off; 9router's
+own request log off, because Bothea's egress log is the record.
+
+**The advisory numbers are a claim, not a citation.** "19 published advisories, 6 critical, all
+fixed by 0.5.6" comes from a third-party review of the project, not from an upstream advisory
+database, and the exact version mentioned in that review (`0.5.112`) is likewise unverified
+against the repository. Treat both as a prompt to check the source before pinning, not as a
+fact to copy. That is also why the config carries no `expect_version`: Bothea records the
+version it finds, logs it per run, and warns when it changes since the last run. A version
+string in config would be a guess that eventually reads as a guarantee.
 
 **Providers.** API-key providers only. Subscription/OAuth credentials MUST NOT be connected
 (`D-011`) — see §6 for why. This sacrifices 9router's headline "free/cheap fallback" behaviour;
@@ -143,10 +178,11 @@ that behaviour is the part with terms risk and the part Bothea does not need.
       tokenise request -> terms; a tag matches on exact term or stem
 2. if a single expert has the top score > 0: choose it, reason = "tags: rust, refactor"
 3. if tie or no score:
-      if router.mode == "model" and router.model is loaded:
-          ask the small model, constrained to the candidate set
+      if router.mode == "model" and router.model is being served
+         at llama.base_url (checked, not assumed):
+           ask the small model, constrained to the candidate set
       else:
-          ask the lead (interactive) or refuse (unattended)
+           ask the lead (interactive) or refuse (unattended)
 ```
 
 **Validating tags before enabling.** Tags are metadata that cannot rot silently, so they are
@@ -194,7 +230,7 @@ mechanism from M4. Its ordering constraint is the plugin, not the harness.
 
 Consequences of deferring it:
 
-- **M0–M3 do not mention it.** No image work, no Node in the guest, no proxy route, no
+- **S1–M3 do not mention it.** No image work, no Node in the guest, no proxy route, no
   compliance document is needed to build the core, the VM, or sync.
 - **The API-key requirement moves to plugin authoring time.** When the plugin is eventually
   written, it MUST authenticate with an API key. A subscription login relayed through the proxy

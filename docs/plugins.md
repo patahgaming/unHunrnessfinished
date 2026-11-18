@@ -47,10 +47,10 @@ forces a re-install and a fresh approval (`docs/permissions.md` §2).
 
 ```toml
 schema = 1
-name = "qwen3-coder"
+name = "qwen2.5-coder-7b"
 version = "1.0.0"
 type = "expert"
-summary = "Local code expert"
+summary = "Local code expert, 7B Q4_K_M"
 tags = ["code", "rust", "refactor"]
 license = "apache-2.0"
 
@@ -58,17 +58,20 @@ license = "apache-2.0"
 kind = "gguf"                    # gguf | api
 
 [backend.gguf]
-source   = "hf:Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF"
-file     = "qwen3-coder-30b-a3b-q4_k_m.gguf"
-sha256   = "…"
-ctx      = 8192
-gpu_layers = "auto"
+source   = "hf:Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+file     = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+sha256   = "…"                   # recorded at install time; required
+ctx      = 8192                  # a claim, verified against the server's /props
 
 [backend.api]                    # alternative; mutually exclusive with [backend.gguf]
-provider = "anthropic"           # a 9router provider id; reached via the proxy
-model    = "claude-sonnet-5"
+provider = "<9router provider id>"
+model    = "<provider model id>"
 max_output_tokens = 8192
 ```
+
+Note what is **not** in the GGUF section: no `gpu_layers`, no `n_gpu_layers`, no launch flags.
+The lead's own `llama-server` command line owns those, and the manifest would be a lie about a
+process Bothea does not start (`D-021`). `ctx` stays because it is a claim the core can check.
 
 **Validation rules** the core enforces (FR-C4):
 
