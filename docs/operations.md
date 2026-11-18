@@ -9,10 +9,10 @@ The daily surface: CLI, config, log schema, `doctor`, and runbooks.
 ```text
 bothea init [--workspace <path>]        create config, repo, keys, allowlist skeleton
 bothea doctor [--json]                  check every prerequisite; pass/fail + remedy
-bothea run "<request>" [--expert <n>] [--no-router] [--dry-run] [--allow-tcg]
+bothea run "<request>" [--expert <n>] [--no-router] [--dry-run]
 bothea run --continue <run_id> [--expert <n>]
 
-bothea vm start [--ephemeral] [--allow-tcg]
+bothea vm start [--ephemeral]
 bothea vm stop
 bothea vm status [--json]
 bothea vm reset                         discard overlay, reinstall from tools.lock.json
@@ -60,8 +60,7 @@ image_sha256 = "…"
 cpus        = 4
 memory_mb   = 4096
 disk_gb     = 20
-accel       = "auto"               # auto | whpx | tcg
-allow_tcg   = false
+accel       = "whpx"               # only supported value; emulation fallback is deferred (D-016)
 ssh_port    = 22022
 proxy_port  = 18080
 boot_timeout_s = 90
@@ -94,13 +93,15 @@ mode    = "tags"                   # tags | model
 model   = "qwen3-1.7b-q4"
 
 [llama]
-port_base      = 18090
-idle_unload_s  = 600
+# External process, started and stopped by the lead (D-021). Bothea only connects.
+base_url = "http://127.0.0.1:18090"
 
-[nine_router]                      # the 9router process, not Bothea's own [router]
-version = "0.5.112"                # pinned; commit recorded in state/pins.json
-port    = 20128
-require_api_key = true
+[nine_router]
+# External application (D-009). Bothea only calls the HTTP endpoint; provider keys
+# live in 9router's own configuration and never enter Bothea.
+base_url    = "http://127.0.0.1:20128"
+client_key  = "keyring:bothea-nine-router"   # Bothea's only 9router secret
+expect_version = "0.5.x"                     # warn on drift; never auto-update
 
 [sync]
 snapshot_refs            = "forever"  # refs are never deleted (D-008)
@@ -161,15 +162,16 @@ Every check prints `ok` / `warn` / `fail` with the value it observed and a one-l
 | Group | Checks |
 |---|---|
 | Host | Windows build ≥ 10.0.19041 · x64 · RAM total · free disk on `state` and `workspace` volumes · long paths enabled |
-| Hypervisor | WHPX feature enabled · probe boot result · recorded accel vs current |
+| Hypervisor | WHPX feature enabled · probe boot result · recorded accel vs current · **no fallback exists, so this is a hard check** |
 | Image | file exists · sha256 matches config · overlay present/absent · base kernel = expected |
-| Tools | qemu version = pinned · git present and version · node ≥ 20 (only if 9router enabled) |
+| Tools | qemu version = pinned · git present and version |
 | Egress | firewall rule present and per-executable · proxy can bind its ports · allowlist parses |
-| Keys | key store ACL is owner-only · 9router SQLite ACL · no key material inside the guest image |
+| Keys | key store ACL is owner-only · no key material inside the guest image |
+| External | `llama.base_url` answers `/v1/models` · `nine_router.base_url` answers with the client key · version matches `expect_version` · served model matches the manifest |
 | Repo | `.gitattributes` has `* -text` · `core.*` flags match §6 of `docs/sync.md` · no models/state tracked · case collisions absent |
 | Guest | broker protocol version matches core · tools.lock.json nar hashes resolve |
 | Plugins | every `[permissions]` value is in the enum · every host cap actually applied is reported · manifest hash matches the approved install |
-| Pins | QEMU/image/nixpkgs/9router/GGUF hashes match `state/pins.json`; drift is reported, never fixed silently |
+| Pins | QEMU/image/nixpkgs/9router-version/GGUF hashes match `state/pins.json`; drift is reported, never fixed silently |
 
 The canary check is part of the secret scan: `doctor` plants a known fake token inside the
 configured key store for the duration of the scan and asserts the scanner finds it. A scanner
@@ -185,7 +187,15 @@ merge: `bothea sync --restore <snapshot>`.
 **The VM won't start.**
 `bothea doctor` first. Then `bothea vm logs` for the serial console. Then `bothea vm reset` —
 which costs a tool reinstall and nothing else. If the message is about egress enforcement, it
-is a refusal by design: fix the firewall rule rather than bypassing it.
+is a refusal by design: fix the firewall rule rather than bypassing it. If it says WHPX is
+unavailable, there is no fallback to reach for (`D-016`) — that is K-1, and it is an
+architecture conversation, not a troubleshooting step.
+
+**An expert won't answer.**
+Bothea does not own llama-server or 9router (`D-009`, `D-021`), so the first move is always
+the lead's own process, not Bothea: is it running, which model is loaded, is the port right.
+`bothea experts list` shows what Bothea can see at the configured endpoints and what it
+expected from each manifest. Bothea will not restart them, by design.
 
 **A run is stuck or looping.**
 `Ctrl-C` cancels: the core sends `cancel`, then kills the process group, then stops the VM if
@@ -227,5 +237,5 @@ lock-in, no proprietary format, no database.
 | Snapshot refs | never deleted (`D-008`) |
 | Prunable snapshot content (ignored, untracked ≥ 10 MB) | 30 days, then tree rewrite + `gc` |
 | Serial console logs | 7 days |
-| 9router SQLite | never pruned; it is credential material |
+| 9router's own data | outside Bothea; the lead's backup problem, never Bothea's |
 | `pins.json` | never pruned; it is the reproducibility record |

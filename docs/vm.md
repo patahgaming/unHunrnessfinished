@@ -12,8 +12,8 @@ keys. WSL2 would be faster and easier and would share a kernel while making the 
 filesystem trivially reachable — which is the exact thing this project exists to prevent
 (`D-001`).
 
-K-1 in the PRD is the escape hatch: if WHPX cannot be made to work and TCG is unusably slow,
-the isolation model gets renegotiated rather than abandoned silently.
+K-1 in the PRD is the stop-gate: if WHPX cannot be made to work, the isolation model is
+renegotiated rather than abandoned silently. There is currently no fallback (`D-016`).
 
 ## 2. Acceleration
 
@@ -33,20 +33,21 @@ MSI-injection failure on some hosts):
 -accel whpx,kernel-irqchip=off
 ```
 
-`doctor` reports three states:
+`doctor` reports these states. **Anything other than `whpx` refuses to start** (FR-V2):
 
 | State | Meaning | Core behaviour |
 |---|---|---|
 | `whpx` | Accelerator runs and a guest probe boots | normal |
-| `whpx-present` | API present, probe fails | report the failing flag; allow `--accel-flag` override; do not silently downgrade |
-| `tcg` | No hardware acceleration | interactive: prompt with warning; unattended: refuse (FR-V2) |
+| `whpx-present` | API present, probe fails | refuse; print the failing flag and the probe output; `--accel-flag` exists for S1 diagnosis only |
+| `whpx-missing` | Feature not enabled | refuse; print the `DISM` command |
 
-TCG is allowed, never automatic. `bothea vm start --allow-tcg` records `accel=tcg` in the run
-header and warns that commands may take an order of magnitude longer.
+**There is no software-emulation path in this version** (`D-016`). TCG is deferred, not
+cancelled: if WHPX fails on the host, K-1 fires and the architecture decision is revisited
+deliberately. Shipping a TCG fallback would mean shipping a session that is an order of
+magnitude slower, which reads as a hang and teaches the lead to blame the wrong component.
 
-**Measured, not assumed.** S1 records cold-boot seconds for each state on the actual machine
-and writes them into the config as `boot_seconds_expected`, so later runs can flag a
-regression.
+**Measured, not assumed.** S1 records cold-boot seconds on the actual machine and writes them
+into the config as `boot_seconds_expected`, so later runs can flag a regression.
 
 ## 3. Guest image
 
@@ -125,15 +126,24 @@ next start finds the lock, verifies the pid is really QEMU, and kills or reports
 
 Budget is arithmetic the lead can see, never a heuristic (FR-V4).
 
-```text
-host_ram        = total physical RAM (from the OS)
-reserved_host   = 2048 MB            # OS + browser + the core
-expert_footprint = model_file + kv_cache(ctx) + 512 MB    # per docs/models.md §2
-vm_ram          = config.vm.memory_mb  (default 4096)
+Bothea does not own the model processes (`D-021`), so it cannot reserve memory for a model that
+may never load. The budget therefore measures what is **running**, and the model check happens
+at routing time rather than at VM start.
 
-if vm_ram + reserved_host + max(expert_footprint) > host_ram:
+```text
+host_ram       = total physical RAM (from the OS)
+reserved_host  = 2048 MB            # OS + browser + the core itself
+resident_now   = RSS of llama-server / 9router processes currently up, if any
+vm_ram         = config.vm.memory_mb  (default 4096)
+
+if vm_ram + reserved_host + resident_now > host_ram:
     refuse, printing all four numbers and the shortfall
 ```
+
+A separate check runs before routing to a local expert (`docs/models.md` §2): that model's
+estimated footprint against free RAM at that moment, refusing with its own arithmetic. Two
+checks, two moments, because two different things can go wrong — the VM not fitting, and the
+model not fitting.
 
 CPU: `vm.cpus` default `min(4, physical_cores - 2)`, and the sum of vCPUs across all VMs plus
 one core for the core itself must not exceed physical cores.
@@ -208,7 +218,7 @@ core has one place to enforce timeouts and cancellation (`docs/plugins.md` §4).
 
 Every message names the violated rule and the numbers (FR-O4). Examples:
 
-- `refused: WHPX not available (state=tcg). Boot unavailable in unattended mode. Re-run interactively or pass --allow-tcg.`
+- `refused: WHPX not available (state=whpx-missing). No software-emulation fallback in this version (D-016). Enable: DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform /All`
 - `refused: VM 4096 MB + reserved 2048 MB + expert 6400 MB = 12544 MB > host 16384 MB (shortfall 2160 MB).`
 - `refused: egress enforcement unavailable (firewall rule not applied). Sandbox would be unenforced.`
 - `failed: guest unhealthy after 90 s; last broker ping 30000 ms. Serial log: state/logs/vm-serial-<id>.log`

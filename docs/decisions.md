@@ -18,9 +18,9 @@ filesystem reachable by default; restricting it is configuration, and configurat
 AI would be attacking.
 **Cost:** a hypervisor to manage, a slow boot path, and a whole class of transport problems
 that WSL2 would not have.
-**Revisit if:** S1 shows no WHPX and a TCG boot over 3 minutes. Then the isolation model gets
-renegotiated explicitly (WSL2 plus a restricted mount, or a host-only sandboxed folder), not
-quietly downgraded.
+**Revisit if:** S1 shows no WHPX on the target machine. Because there is no emulation fallback
+(`D-016`), that is K-1, not a tuning problem: the isolation model gets renegotiated explicitly
+(WSL2 plus a restricted mount, or a host-only sandboxed folder).
 
 ## D-002 — Host→guest SSH with a broker, no shared folder
 
@@ -113,24 +113,36 @@ history, so it is what gets bounded.
 from an old snapshot. Documented in the runbook rather than discovered; `doctor` reports the
 snapshot store's size so the bound is visible.
 
-## D-009 — The egress proxy and 9router are separate processes
+## D-009 — 9router is an external application, reached over HTTP
 
 **Status:** accepted.
-**Decision:** `guest → bothea proxy (policy + keys) → 9router (provider gateway) → provider`.
-**Replaced:** the draft's single "host proxy" that was also the 9router instance.
+**Decision:** `guest → bothea proxy (policy + egress log) → 9router (external app) → provider`.
+Bothea calls 9router's HTTP endpoint and nothing else. It does not start, stop, configure, or
+inspect it. Provider keys live in 9router's configuration and never enter Bothea; Bothea holds
+only the 9router client key.
+**Replaced:** the draft's single "host proxy" that was also the 9router instance, and the
+earlier assumption that Bothea would manage 9router's lifecycle as part of a VM session.
 **Why:** 9router is a Node app with a dashboard, a Cloudflare tunnel, cloud sync, proxy pools,
 and a MITM bridge. Making it the security boundary means the boundary is a third-party web
-app's route table. The proxy is small, Bothea-owned, and testable.
-**Cost:** one more process and a hop.
+app's route table — and owning its lifecycle means a VM restart can kill a provider connection.
+Separating the two keeps the boundary small and Bothea-owned, and keeps 9router out of the VM
+session entirely.
+**Cost:** one hop, and one credential Bothea must hold (the client key) so the guest cannot
+reach 9router usefully.
 
-## D-010 — 9router pinning and hardening
+## D-010 — 9router hardening is the lead's, and Bothea prints the checklist
 
 **Status:** accepted.
-**Decision:** pinned version and commit; loopback only; `REQUIRE_API_KEY`; `INITIAL_PASSWORD`
-set; tunnel, cloud sync, MITM bridge and proxy pools disabled; its own request log off.
-**Why:** the project has 19 published advisories (6 critical, all fixed by 0.5.6) and ships
-remote-reachability features Bothea must not have (N1).
-**Cost:** none worth naming; these are all defaults flipped the safe way.
+**Decision:** Bothea does not enforce 9router settings; it prints and re-prints the checklist
+and verifies what it can see from outside (endpoint answers, version string, key required).
+The lead owns: pinned version and recorded commit; loopback bind; `REQUIRE_API_KEY`;
+`INITIAL_PASSWORD` set before first start; tunnel, cloud sync, MITM bridge and proxy pools off;
+9router's own request log off.
+**Why:** an application Bothea does not own cannot be configured by Bothea. Pretending
+otherwise would produce a false sense of enforcement. What Bothea *can* do is refuse to use an
+endpoint that does not answer with the client key, and report a version it did not expect.
+**Cost:** a checklist that can be ignored. Mitigated by `doctor` failing when the endpoint
+answers without a key.
 
 ## D-011 — No subscription or OAuth credentials, anywhere
 
@@ -154,15 +166,23 @@ folder".
 **Cost:** the lead cannot keep a private scratch copy inside the repo without it being a commit.
 That is a feature.
 
-## D-013 — Claude Code is an explicit tool, and an explicit exception
+## D-013 — Claude Code is a plugin tool, deferred until after M3
 
-**Status:** accepted, **blocked on the compliance gate** (`docs/models.md` §6).
-**Decision:** invocable only by an explicit lead command; never router-selected; runs in the
-guest under the same per-action policy as any other tool; its transcript is captured as an artifact.
-**Why the exception:** it is an agent inside a tool, which contradicts "experts do not call
-experts" (rev-2 §3.2). Leaving that contradiction undocumented would mean shipping two policies.
-**Consequence if blocked:** K-3 applies — the expert + tool loop must stand alone or the
-product stops at M5.
+**Status:** accepted. Removed from the core roadmap.
+**Decision:** Claude Code is a plugin tool. It is not part of M0–M3, and no core work depends
+on it beyond the generic tool plugin mechanism from M4. When the plugin is authored it must
+authenticate with an API key — a subscription login relayed through the proxy is not an
+acceptable implementation (`D-011`) — and it must record its compliance basis first.
+**Why:** the API-key rule is a condition on *that plugin*, not on the harness. Deferring it
+means the core, the VM and sync are never built against a component whose admissibility is
+uncertain, and a terms problem shrinks from "the product has no user" to "this plugin is not
+written".
+**Why an explicit exception is still needed:** it is an agent inside a tool, which contradicts
+"experts do not call experts" (rev-2 §3.2). The exception is: explicit lead invocation only,
+never router-selected, same per-action policy as any other tool, egress through the proxy,
+transcript captured as an artifact, budget plus a hard wall clock.
+**Consequence if the compliance basis fails:** the plugin is not written. The expert path is
+unaffected (K-3).
 
 ## D-014 — This set supersedes the Milestone 1 design doc
 
@@ -186,15 +206,22 @@ repository. The list is small enough to keep inline; the diffs are reproducible 
 **Cost:** reviewing a sync needs one extra command. Acceptable: it is one command, and the ids
 are in the record.
 
-## D-016 — TCG requires explicit opt-in
+## D-016 — WHPX only; the emulation fallback is deferred, not cancelled
 
-**Status:** accepted.
-**Decision:** no automatic software-emulation fallback. Interactive: prompt with a warning.
-Unattended: refuse.
-**Replaced:** rev-2 §5 "start with software emulation and show a clear warning".
-**Why:** a silent downgrade produces a session that is 10–50× slower and looks like a hang.
-The lead must know before work starts, not after twenty minutes of waiting.
-**Cost:** one flag to type on a host without WHPX.
+**Status:** accepted, and it makes K-1 a hard stop-gate.
+**Decision:** there is no software-emulation path in this version. If WHPX does not work, the
+VM does not start, Bothea says so with the `DISM` command, and the architecture decision is
+revisited deliberately. TCG remains a candidate for a later version and is recorded as
+deferred.
+**Replaced:** rev-2 §5 "start with software emulation and show a clear warning", and the
+earlier `--allow-tcg` opt-in.
+**Why:** a TCG session is 10–50× slower and reads as a hang. Shipping it as a fallback means
+every WHPX misconfiguration is diagnosed as "Bothea is slow" instead of "the feature is off".
+Worse, it lets the project drift past the moment where the isolation model should have been
+re-examined.
+**Cost:** a machine without WHPX cannot run Bothea at all. That is the intended trade: it makes
+the limitation loud and immediate rather than quiet and confusing. Re-enabling TCG later is an
+additive change, not a rewrite.
 
 ## D-017 — Tools install at runtime, pinned by lockfile
 
@@ -239,20 +266,44 @@ when the answer is not obvious yet.
 
 ---
 
+## D-021 — The lead runs llama-server; Bothea only checks `/health`
+
+**Status:** accepted.
+**Decision:** option (a). llama-server is not in Bothea's process tree. Bothea connects to
+`llama.base_url`, checks `/v1/models`, compares the served identity against the manifest, and
+refuses to route on a mismatch. It never spawns, signals, or kills the process, and it has no
+idle-unload policy.
+**Replaced:** the earlier plan where Bothea started llama-server per model and unloaded it after
+`idle_unload_s`.
+**Why:** before M5, lifecycle responsibility is pure risk with no payoff. A process Bothea owns
+must be babysat: orphans on a core crash, zombie models holding VRAM, a second failure surface
+in every run. A process Bothea merely talks to has none of that, and the lead already knows how
+to start the model they want.
+**Consequences, accepted explicitly:**
+- Bothea cannot reserve memory for a model it does not start, so the resource guard measures
+  what is *running* and the model-fit check happens at routing time (`docs/vm.md` §5).
+- G5 ("idle cheap") becomes the lead's policy rather than an enforced behaviour; Bothea reports
+  what is resident so the decision is informed.
+- If the manual step becomes the bottleneck, option (b) — Bothea starts it with an explicit
+  "not owned" boundary — is the recorded next step. Deferred, not rejected.
+
+---
+
 ## Mapping from the rev-2 draft
 
 | Rev-2 item | Resolution |
 |---|---|
 | §2 three workspace copies | D-012 |
-| §5 WHPX with software fallback | D-016 (opt-in), plus the q35 / `kernel-irqchip=off` combination |
+| §5 WHPX with software fallback | D-016 — WHPX only; fallback deferred, K-1 hard stop-gate; plus the q35 / `kernel-irqchip=off` combination |
 | §6 "three-way, the way git merges" | `docs/sync.md` — bundles, snapshots, `--no-ff`, abort-on-conflict |
 | §7 smart / yolo open question | D-005 — per-plugin declarations, host-capped |
 | §7 "conflicts always require the user's decision" | D-020 |
 | §7 "shell commands inside the VM" | `docs/permissions.md` §2 |
-| §8 9router as the proxy | D-009, D-010 |
-| §9 Claude Code "check the terms" | `docs/models.md` §6 — a gate with three outcomes, not a checkbox |
+| §8 9router as the proxy | D-009 — external app over HTTP; D-010 |
+| §9 Claude Code "check the terms" | D-013 — deferred plugin; API-key condition at authoring time |
 | §13 open decisions 1–4 | D-015, D-005, D-007, D-008 |
 | (unstated) host↔guest transport | D-002 |
 | (unstated) image provenance | `docs/vm.md` §3, D-017 |
+| (unstated) llama-server ownership | D-021 — lead runs it; Bothea checks `/health` |
 | (unstated) task loop bounding | `docs/architecture.md` §5, FR-C5/C6 |
 | (unstated) crash recovery | `docs/architecture.md` §8, FR-S8 |

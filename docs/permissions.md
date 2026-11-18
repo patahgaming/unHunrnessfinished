@@ -104,17 +104,17 @@ model gets a chance to do something else.
 
 Two roles, deliberately separate (`D-009`). The rev-2 draft merged them into "the host proxy,"
 which makes 9router — a Node app with a dashboard, a tunnel, and a MITM bridge — the security
-boundary. It should not be.
+boundary. It should not be, and it is not Bothea's application to begin with.
 
 ```text
   guest tool
      │  scoped token, host allowlist subset
      ▼
   bothea egress proxy        127.0.0.1:18080     ← the boundary lives here
-     │  allowlist check · method check · request log · credential injection
+     │  allowlist check · method check · request log · key injection
      ▼
-  9router                    127.0.0.1:20128     ← provider gateway, no policy
-     │  per-session client key
+  9router  [external app]    127.0.0.1:20128     ← provider gateway, no policy
+     │  its own config holds the provider keys
      ▼
   provider (api.openai.com, api.anthropic.com, …)
 ```
@@ -123,15 +123,21 @@ boundary. It should not be.
 
 - Verify the caller's token and derive its allowlist from the token, not from the request.
 - Match `(method, host, path-prefix)` against the allowlist. Default deny.
-- Strip any inbound `Authorization` / `x-api-key` / `cookie`, then inject the real credential.
-  The guest's header must never win, in any code path, including errors.
+- Strip any inbound `Authorization` / `x-api-key` / `cookie`, then inject what the upstream
+  needs — the 9router client key for provider calls. The guest's header must never win, in any
+  code path, including errors.
 - Log `{run_id, tool, method, host, path_prefix, bytes_out, bytes_in, ms, outcome}` — never a
   body, never a header value.
 - Refuse `CONNECT` to non-allowlisted hosts so a clever tool cannot tunnel.
 
+**Provider keys are not Bothea's.** They live in 9router's configuration, on the host. Bothea
+holds exactly one 9router credential — the client key — so that the guest's loopback access
+(`docs/vm.md` §6) cannot spend quota without a logged egress record. If 9router has
+`REQUIRE_API_KEY` off, that protection disappears; it is the first item on the hardening
+checklist Bothea prints.
+
 **9router responsibilities.** Provider format translation, quota accounting, fallback among
-*API-key* providers. Nothing else. Its own request logging is off; Bothea's proxy log is the
-record.
+*API-key* providers. Nothing else. Bothea does not start it, configure it, or read its database.
 
 **The allowlist lives in config**, not in a manifest (`docs/operations.md` §2). A plugin may
 `ask` for a host; it cannot add one.

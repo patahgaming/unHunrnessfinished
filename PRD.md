@@ -104,14 +104,15 @@ free. Bothea refuses with the arithmetic and does not start a model.
 
 - **FR-V1** The core MUST start and stop a QEMU guest, and MUST report the guest as healthy
   only after a successful authenticated round trip on the control channel.
-- **FR-V2** The core MUST detect hardware acceleration on every start. If WHPX is
-  unavailable, the core MUST refuse to start an unattended run and MUST require an explicit
-  `--allow-tcg` for an interactive one, printing a measured or estimated slow-boot warning.
+- **FR-V2** The core MUST detect hardware acceleration on every start and MUST refuse to start
+  a VM unless WHPX is working. There is no software-emulation path in this version: fallback
+  is deferred, not cancelled (`D-016`), and K-1 governs what happens if WHPX cannot be made to
+  work.
 - **FR-V3** The core MUST verify, before accepting a guest session, that (a) the guest can
   reach the egress proxy and (b) the guest cannot reach a non-allowlisted destination.
   Failure is a hard start failure, not a warning.
-- **FR-V4** The core MUST compute a resource budget from host totals and the configured expert
-  footprint, and MUST refuse configurations that exceed available RAM or CPU.
+- **FR-V4** The core MUST compute a resource budget from host totals and currently resident
+  processes, and MUST refuse configurations that exceed available RAM or CPU.
 - **FR-V5** The core MUST NOT pass a host filesystem share into the guest.
 - **FR-V6** The core MUST guarantee no orphan QEMU process outlives the core.
 - **FR-V7** The VM MUST NOT contain any credential material. *(Acceptance: a secret scan of
@@ -165,9 +166,13 @@ free. Bothea refuses with the arithmetic and does not start a model.
 ### Experts and routing
 
 - **FR-E1** An expert MUST be either a local GGUF served by llama-server or an API model
-  reached through 9router. Both MUST present the same internal interface to the core.
-- **FR-E2** Before loading a GGUF, the core MUST check file size plus a KV-cache estimate
-  against free RAM and MUST refuse with the arithmetic if it does not fit.
+  reached through 9router. Both MUST present the same internal interface to the core, and both
+  services MUST be treated as external: Bothea reaches them at a configured HTTP endpoint and
+  records what it finds (`FR-E7`).
+- **FR-E2** Before routing to a local expert, the core MUST estimate its footprint (weights +
+  KV cache at the manifest's context size + overhead) and compare it against free RAM at that
+  moment, refusing to route and printing the arithmetic if it does not fit. This is a
+  precondition, not a reservation: Bothea does not load the model (`D-021`).
 - **FR-E3** Routing MUST default to disabled; the lead selects the expert, or picks from a
   prompted candidate list. Tag scores MUST still be computable and shown while routing is
   disabled. Routing MAY be enabled only as a recorded lead action after tag suggestions have
@@ -177,8 +182,13 @@ free. Bothea refuses with the arithmetic and does not start a model.
 - **FR-E4** An expert MUST NOT dispatch another expert. Only the core does that, on the
   lead's instruction.
 - **FR-E5** A run MUST stay with one expert for its duration unless the lead reassigns.
-- **FR-E6** Claude Code MUST be invocable only by an explicit lead command, never selected
-  automatically, and only after the compliance gate in `docs/models.md` §6 is recorded.
+- **FR-E6** Claude Code is a plugin tool, deferred until after M3; no core requirement depends
+  on it. When that plugin is authored it MUST authenticate with an API key (never a relayed
+  subscription login), MUST be invocable only by an explicit lead command, and MUST record its
+  compliance basis before installation.
+- **FR-E7** Bothea MUST NOT start, stop, or supervise llama-server or 9router. It MUST verify
+  reachability, log the version it found, and refuse to route to a model whose served identity
+  does not match the manifest.
 
 ### Permissions and egress
 
@@ -191,10 +201,12 @@ free. Bothea refuses with the arithmetic and does not start a model.
   `deny` and is not declarable.
 - **FR-SEC3** Network egress MUST be allowlisted by host, and each request MUST be logged
   with method, host, and byte counts, and without credentials or bodies.
-- **FR-SEC4** Credentials MUST be injected by the proxy and MUST never be observable by the
-  guest, including in error paths and proxy responses.
-- **FR-SEC5** The key store MUST be readable only by the core's user and MUST be excluded
-  from every sync, snapshot, and backup that Bothea performs.
+- **FR-SEC4** The proxy MUST inject whatever credential the upstream requires — for provider
+  calls, the 9router client key — and MUST never make it observable by the guest, including in
+  error paths and proxy responses. Provider keys MUST NOT enter Bothea at all.
+- **FR-SEC5** The key store MUST hold only Bothea's own material (guest ssh key, 9router client
+  key, per-session tokens), MUST be readable only by the core's user, and MUST be excluded from
+  every sync, snapshot, and backup that Bothea performs.
 
 ### Observability and operations
 
@@ -214,7 +226,8 @@ free. Bothea refuses with the arithmetic and does not start a model.
 - **NFR-3 Recovery**: any sync-related mistake MUST be reversible in under 2 minutes using
   documented commands only.
 - **NFR-4 Auditability**: no state change without a log line; no log line without a `seq`.
-- **NFR-5 Portability**: Windows 10 2004+ / Windows 11, x64, WHPX or explicit TCG.
+- **NFR-5 Portability**: Windows 10 2004+ / Windows 11, x64, with the Windows Hypervisor
+  Platform feature enabled. WHPX is required; there is no emulation fallback in this version.
 - **NFR-6 Determinism**: QEMU version, guest image hash, nixpkgs revision, 9router commit, and
   every GGUF sha256 are pinned and recorded; `doctor` reports drift.
 - **NFR-7 Safety**: no configuration option may disable the hard deny on outside-workspace
@@ -235,14 +248,17 @@ The sample size is one, so these are falsifiable checks rather than statistics.
 
 These exist so the project can stop on evidence rather than on mood.
 
-- **K-1** If S1 cannot produce a WHPX-accelerated boot, and TCG boot exceeds 3 minutes, the
-  QEMU design is not viable for interactive work. Pivot to WSL2 plus a restricted mount, or
-  to a host-only sandboxed folder. Do not proceed to M2.
+- **K-1** **Hard stop-gate.** If S1 cannot produce a WHPX-accelerated boot on the target
+  machine, the QEMU design is not viable in this version — there is no software-emulation
+  fallback (`D-016`). Stop before M2 and choose the pivot deliberately, with the S1 numbers in
+  hand: WSL2 with a restricted mount, a host-only sandboxed folder, or deferral. Do not proceed
+  on the assumption that a fallback will appear.
 - **K-2** If after the first end-to-end slice (M5) a representative task takes more than 1.5×
   the wall-clock of doing the same task with Claude Code in a plain folder — and the gap is
   not explained by a control the lead actually values — stop and reassess the VM tax.
-- **K-3** If the Claude Code compliance gate fails and the expert path cannot produce a usable
-  coding loop on its own, the product has no user. Stop before M7.
+- **K-3** If the Claude Code plugin's compliance basis cannot be established, that plugin is
+  not written. This does **not** stop the product: the expert path never depended on it
+  (`D-013`).
 
 ## 11. Milestones
 
@@ -253,8 +269,9 @@ is built on them.
 
 Prove: WHPX boot of a NixOS qcow2, headless serial console, SSH over a host-forwarded port,
 egress blocked, proxy reachable.
-**Exit:** boot time recorded under WHPX and TCG; the four egress probes behave correctly;
-`-machine q35 -accel whpx,kernel-irqchip=off` is the recorded working combination.
+**Exit:** WHPX boot time recorded (the only supported accelerator); the six egress probes
+behave correctly; `-machine q35 -accel whpx,kernel-irqchip=off` is the recorded working
+combination. If this exit cannot be met, K-1 fires.
 
 ### S2 — Sync spike (no product code)
 
@@ -294,27 +311,33 @@ a manifest declaring `network = "allow"` is capped by the host and the cap is lo
 
 ### M5 — Experts and router
 
-llama-server manager, 9router client, tag router with override, usage accounting.
-**Exit:** FR-E1..E5; J2 and J6; one local and one API expert each complete a 5-step task with
-tools; a runaway loop is stopped by budget with a clear message. **This milestone is the
-first end-to-end value; K-2 is evaluated here.**
+HTTP clients for the two external services (llama-server, 9router), the tag router with
+override, usage accounting. `llama-server` and `9router` are started by the lead, never by
+Bothea (`D-021`, `D-009`).
+**Exit:** FR-E1..E7; J2 and J6; one local and one API expert each complete a 5-step task with
+tools; a model whose served identity disagrees with its manifest is refused; a runaway loop is
+stopped by budget with a clear message. **This milestone is the first end-to-end value; K-2 is
+evaluated here.**
 
-### M6 — Claude Code and packaging
+### M6 — Packaging
 
-Compliance gate, proxy wiring, single-bundle packaging, clean-machine install.
-**Exit:** FR-E6; `doctor` green on a second Windows machine; the compliance decision is
-written down with its source; an uninstall leaves no orphaned firewall rule or key store.
+Single-bundle packaging and clean-machine install. The Claude Code plugin is **optional** and
+tracked separately: it is not required for this milestone to pass and it never blocks it.
+**Exit:** `doctor` green on a second Windows machine; an uninstall leaves no orphaned firewall
+rule, pin record, or key store entry. If the Claude Code plugin is built, its compliance basis
+is recorded first (`D-013`).
 
 ## 12. Risks
 
 | Risk | Impact | Mitigation | Verified by |
 |---|---|---|---|
-| WHPX unusable; TCG too slow | K-1 fires | Spike first; record the flag combination that works | S1 |
+| WHPX unusable on the host | **K-1 hard stop-gate**; no fallback exists | S1 before any product code; record the flag combination or stop | S1 |
 | Nix on Windows can't build the guest image | M2 blocked | Build in CI or WSL2; pin and publish the artifact | S1 |
 | Windows↔Linux git noise masquerades as edits | Sync unusable | `-text` attributes, no autocrlf, no filemode, preflight collision scan | S2 |
 | Egress enforcement leaks through host loopback | Key exfiltration | Per-executable firewall rule, loopback-only listeners, per-session tokens | S1 gate |
-| 9router advisories or its optional tunnel features | Host compromise | Pin version, bind loopback, disable tunnel/cloud/MITM, keep it behind the proxy | M5 |
-| Claude Code terms prohibit the proxy path | M6 has no product | Verify early; expert path must stand alone; K-3 | M6 gate |
+| 9router advisories or its optional tunnel features | Host compromise | External app: Bothea prints the hardening checklist and verifies only the endpoint; the lead pins the version and disables tunnel/cloud/MITM | M5 |
+| Claude Code terms prohibit the API-key path | The plugin is never written | Deferred plugin: verify at authoring time; the expert path never depended on it | plugin authoring |
+| Bothea quietly grows lifecycle duties for external services | The boundary erodes; a crash takes down more than it should | FR-E7 and D-021: health-check only, never spawn or kill | M5 |
 | Agent edits and lead edits collide constantly | G2 violated | One collapsed working tree; per-step VM commits; snapshot refs | M3 |
 | Sync tax exceeds its value | K-2 fires | Measure at M5 with a real task | M5 |
 | Permission model changes how plugins are written | M4 slips, plugins rewritten | Confirmation gate before M4; manifests are small and mechanical | M4 |

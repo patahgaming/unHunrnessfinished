@@ -1,7 +1,7 @@
-# Models, routing, and the Claude Code gate
+# Models, routing, and the deferred Claude Code plugin
 
-Requirements FR-E1..E6. Covers local GGUF experts, llama-server, 9router, the router, and the
-compliance gate that decides whether M6 exists.
+Requirements FR-E1..E7. Covers local GGUF experts, the two external services (llama-server,
+9router), the router, and the deferred Claude Code plugin.
 
 ---
 
@@ -49,45 +49,84 @@ The estimate is deliberately conservative on weights (assumes full residency rat
 partial mmap). An estimate that is sometimes wrong in the "loads anyway" direction is fine; one
 that is wrong in the other direction means the machine swaps and the lead blames Bothea.
 
-### llama-server
+### llama-server is not Bothea's process
 
-- One process per loaded model, port allocated from `llama.port_base` (default 18090).
-- `--api-key <per-session>` so the loopback namespace is not a free-for-all
-  (`docs/vm.md` §6 residual risk).
-- `--ctx-size`, `--n-gpu-layers` from the manifest. `gpu_layers = "auto"` means: use the host
-  GPU if llama-server was built with a backend and enough VRAM is free, else 0. The GPU is on
-  the host; the VM never sees it (rev-2 §5, unchanged).
-- Idle unload after `llama.idle_unload_s` (default 600). G5 is a requirement, not a slogan.
-- Startup is a blocking health poll on `/health`, with the model path and size in the failure
-  message.
+**Decision (`D-021`): the lead runs llama-server; Bothea only checks `/health` before using a
+model.**
+
+This was the open question — "who starts and stops llama-server?" — and the answer is: not
+Bothea, at least not before M5 has earned the responsibility.
+
+Consequences, stated so nothing is assumed later:
+
+- **Bothea never spawns, never signals, never supervises.** No process handles, no Job Object,
+  no orphan risk, no zombie model after a core crash.
+- **Configuration is an endpoint, not a command line.** `llama.base_url` (default
+  `http://127.0.0.1:18090`). Bothea does not pass `--ctx-size` or `--n-gpu-layers`; the lead's
+  own launch command owns those. The VM never sees the GPU either way (rev-2 §5, unchanged).
+- **Provenance is still recorded, but it is a claim to verify, not a flag to pass.** The
+  manifest carries source, sha256, license, and context size. Bothea queries
+  `GET /v1/models` and compares what is actually being served against the manifest. A
+  mismatch is a refusal with both values printed, not a silent substitution.
+- **No idle unload by Bothea.** The `idle_unload_s` knob is gone; the lead decides when to stop
+  a model. G5 ("idle cheap") becomes the lead's policy, and `bothea experts list` reports what
+  is currently resident so the decision is informed.
+- **Pre-flight is a precondition, not a reservation.** Before routing to a local expert, Bothea
+  computes the footprint (§ above) and reads free RAM. It cannot reserve memory for a process
+  it does not own, so it refuses to *route* to a model that will not fit — rather than refusing
+  to start the VM on behalf of a model that may never be loaded.
+- **Attribution of an overloaded machine changes.** If the lead starts a 30B model at 32k
+  context and the machine swaps, Bothea reports the numbers it saw at routing time and stops
+  guessing.
+
+Revisit only if manual model management becomes the bottleneck. Option (b) — Bothea starts and
+stops it, with an explicit "not owned" boundary — stays on the table and is recorded as
+deferred, not rejected.
 
 ## 3. API experts through 9router
 
-9router (`decolua/9router`, MIT, Node ≥ 20) is a local gateway exposing an
-OpenAI-compatible endpoint. Bothea uses exactly that and nothing else.
+**Decision (`D-009`): 9router is a separate application, not part of Bothea.**
 
-**Hardening, all of it required** (FR-SEC3/4, `D-010`):
+Bothea calls its HTTP endpoint and nothing else. It does not start it, stop it, configure it,
+or read its database.
 
-| Setting | Value | Why |
-|---|---|---|
-| version | pinned, commit recorded | 19 published advisories, 6 critical, all fixed in 0.5.6 |
-| bind | `127.0.0.1:20128` only | never a LAN interface |
-| `REQUIRE_API_KEY` | `true`, key rotated per session | stops the guest from using it directly |
-| `INITIAL_PASSWORD` | set before first start | the fallback default is `123456` |
-| Cloud sync / tunnel | disabled | remote reachability is out of scope (N1) |
-| MITM bridge | disabled | it defeats the whole proxy model |
-| Proxy pools | disabled | unrelated, and it moves traffic where Bothea cannot see it |
-| Provider request logs | off | the egress proxy log is the record |
+```text
+  Bothea  ──HTTP──>  http://127.0.0.1:20128/v1  ──>  provider
+  (no provider keys)     9router config holds the provider keys
+```
+
+- **Provider keys live in 9router's configuration, on the host.** Bothea does not manage them
+  and never sees them. The key store holds only Bothea's own material (the VM ssh key, the
+  9router client key, per-session tokens).
+- **9router is not part of the VM session.** It is not bound to a VM lifetime, so stopping a VM
+  never kills a provider connection, and a 9router restart does not require a VM restart.
+  Bothea health-checks the endpoint at VM start and reports, rather than owning a lifecycle it
+  does not need (`FR-E7`).
+- **The guest still cannot reach it usefully.** The proxy is the only caller that carries the
+  client key, and 9router must require that key (`REQUIRE_API_KEY`) — otherwise the guest's
+  residual loopback access (`docs/vm.md` §6) becomes a way to spend the lead's quota without a
+  logged egress record.
+
+**What Bothea verifies, and what the lead maintains** (FR-E7 keeps these separate):
+
+| Bothea checks | The lead maintains |
+|---|---|
+| endpoint reachable at `nine_router.base_url` | installation and version pin |
+| `GET /v1/models` answers with the client key | provider accounts and keys |
+| the configured model id is present | quota, and which models are connected |
+| version string, logged per run | `REQUIRE_API_KEY`, loopback bind, tunnel/cloud/MITM off |
+| the client key is not empty | rotation |
+
+**Hardening is the lead's responsibility, and Bothea prints it as a checklist** rather than
+pretending to enforce it (`D-010`): pin the version and record the commit (19 published
+advisories, 6 critical, all fixed by 0.5.6); bind `127.0.0.1:20128` only; `REQUIRE_API_KEY`;
+`INITIAL_PASSWORD` set before first start (the fallback default is `123456`); cloud sync,
+tunnel, MITM bridge and proxy pools off; 9router's own request log off, because Bothea's egress
+log is the record.
 
 **Providers.** API-key providers only. Subscription/OAuth credentials MUST NOT be connected
-(`D-011`) — see §6 for why, and note that this sacrifices 9router's headline "free/cheap
-fallback" behaviour. That behaviour is the part with terms risk and the part Bothea does not
-need; a local expert plus one API key covers the requirement.
-
-**Key storage.** 9router keeps credentials in `~/.9router/db/data.sqlite`. That file is
-credential material: it is in the same protection class as the Bothea key store, is excluded
-from sync and from Bothea backups, and `doctor` warns if its ACL is looser than
-owner-only.
+(`D-011`) — see §6 for why. This sacrifices 9router's headline "free/cheap fallback" behaviour;
+that behaviour is the part with terms risk and the part Bothea does not need.
 
 ## 4. The router
 
@@ -147,55 +186,45 @@ the bill.
 Run totals roll up into `run.end`. The lead can then answer "what did this cost me" without
 opening a dashboard.
 
-## 6. Claude Code
+## 6. Claude Code — a plugin tool, deferred
 
-Registered as a tool, installed in the guest, invoked explicitly (FR-E6). Three gates, all
-before M6 is attempted in anger.
+**Decision (`D-013`): Claude Code is a plugin tool, and it is out of scope until after M3.** It
+is not part of the core and requires no core work to support it beyond the generic tool plugin
+mechanism from M4. Its ordering constraint is the plugin, not the harness.
 
-### Gate 1 — compliance, in writing
+Consequences of deferring it:
 
-**Status: unverified. This is a blocker, not a formality.**
+- **M0–M3 do not mention it.** No image work, no Node in the guest, no proxy route, no
+  compliance document is needed to build the core, the VM, or sync.
+- **The API-key requirement moves to plugin authoring time.** When the plugin is eventually
+  written, it MUST authenticate with an API key. A subscription login relayed through the proxy
+  is not an acceptable implementation (`D-011`), regardless of what the CLI supports.
+- **The compliance check is a prerequisite for that plugin, not for the product.** If it fails,
+  the plugin is not written; the expert path is unaffected because it never depended on it
+  (K-3 no longer applies to the product, only to this plugin).
 
-Anthropic's stated position, as reported by the 9router ecosystem's own guidance and by
-third-party writeups, is that OAuth sign-in is intended for ordinary use of native Anthropic
-applications and that routing Free/Pro/Max plan credentials through third-party software is not
-permitted, with enforcement possible without notice. Using an **API key** (pay per token) is
-the documented path and is not the same question.
+### What authoring that plugin must satisfy
 
-The lead must record, in `docs/decisions.md`, one of:
+**1. Authentication.** API key only. Record the basis in `docs/decisions.md` when the plugin is
+created — a dated source, not a recollection. If the primary terms are unclear, the plugin is
+not written.
 
-- **Allowed** — with the primary source quoted and dated; proceed on an API key only.
-- **Disallowed** — M6 is dropped; the expert path must carry the product (K-3).
-- **Unclear** — do not ship it; a product whose main feature might be a terms violation is not
-  shippable.
+**2. The agent-inside-a-tool exception.** Claude Code calls a model and runs its own tools, so
+the guest contains a component acting outside the core's per-step loop. That is an explicit,
+documented exception to "experts do not call experts":
 
-Bothea MUST NOT ship a path that relies on subscription credentials (`D-011`).
-
-### Gate 2 — architecture
-
-Claude Code is an agent. It calls a model and runs its own tools. Inside the guest, that means
-the VM contains a component that can act without the core's per-step loop.
-
-This is an explicit, documented exception to "experts do not call experts":
-
-- it is invocable **only** by an explicit lead command — never selected by the router, never
-  proposed by another expert;
-- it runs in the guest like any tool, under the same per-action policy (`docs/permissions.md`);
+- invocable **only** by an explicit lead command — never router-selected, never proposed by
+  another expert;
+- runs in the guest like any other tool, under the same per-action policy
+  (`docs/permissions.md`);
 - its egress is the proxy, so its model calls are logged like anything else;
-- its own transcript is captured as an artifact, because the core cannot see inside its loop;
+- its transcript is captured as an artifact, because the core cannot see inside its loop;
 - its budget is the run budget plus a hard wall clock.
 
-The exception is recorded as `D-013`. Without it, Bothea would be shipping two contradictory
-policies at once.
+**3. Operational.** Node in tool scope (never the base image), `ANTHROPIC_BASE_URL` pointed at
+the proxy, the CLI's own update check and telemetry disabled, version pinned, and its config
+directory inside the workspace so transcripts land in the log artifacts.
 
-### Gate 3 — operational
-
-Node in the guest (tool scope, not base image), `ANTHROPIC_BASE_URL` pointed at the proxy, the
-tool's own update check and telemetry disabled, and a pinned version. Its config directory is
-inside the workspace so its transcripts land in the log artifacts rather than somewhere the
-lead has to hunt for.
-
-### Why M6 stays last
-
-Because if Gate 1 fails, the product must still work. The expert + tool loop (M5) is the
-product; Claude Code is an accelerant. Ordering reflects that (K-3).
+**Why it is worth deferring at all.** It is an accelerant, not the product. The expert + tool
+loop is the product; if Claude Code were load-bearing, a terms change would end the project.
+Ordering it last is the structural expression of that judgement.

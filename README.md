@@ -19,7 +19,7 @@ This set is the specification. Where it disagrees with the rev-2 draft, this set
 | `docs/sync.md` | Git model, snapshots, bundles, merge, conflicts, Windows/Linux hygiene, tests | *the seam* |
 | `docs/plugins.md` | Plugin protocol, manifest schema, install model, broker, limits | *the extension points* |
 | `docs/permissions.md` | Per-plugin policy declarations, host ceilings, egress allowlist, proxy/9router topology | *the guardrails* |
-| `docs/models.md` | GGUF experts, llama-server, 9router, routing, Claude Code gates | *the intelligence* |
+| `docs/models.md` | GGUF experts, external llama-server and 9router, routing, the deferred Claude Code plugin | *the intelligence* |
 | `docs/operations.md` | CLI, config schema, session log schema, `doctor`, runbooks | *the daily surface* |
 | `docs/decisions.md` | Decision records D-001…D-019, including the four open questions from the draft | *the reasoning* |
 
@@ -55,8 +55,11 @@ Resolved in this set, pending lead sign-off (`docs/decisions.md`):
 - D-005 smart/yolo removed; policy declared per plugin, capped by the host
 - D-007 router off by default until tags are validated
 - D-008 snapshot refs kept forever; large and ignored content pruned at 30 days
+- D-009 9router is an external application, reached over HTTP
+- D-016 WHPX only; the emulation fallback is deferred, not cancelled
 - D-020 a merge conflict is never resolved without the lead
-- plus fourteen more structural decisions the rev-2 draft left implicit.
+- D-021 the lead runs llama-server; Bothea only checks `/health`
+- plus fifteen more structural decisions the rev-2 draft left implicit.
 
 ---
 
@@ -68,4 +71,11 @@ not blocked:
 1. **Where is the Milestone 1 design doc?** Rev-2 §1 refers to it as the reference for the
    host core. It is not in this folder. Default: `M1` in this set is treated as authoritative
    and the old M1 doc is archived as history (`D-014`).
-2. **Is the thin slice an explicit stop-gate?** Default: yes — see `PRD.md` §8 kill criteria.
+2. **Is K-2 also a stop-gate?** K-1 is settled: a hard stop-gate with no fallback (`D-016`).
+   K-2 (the 1.5× sync-tax measurement at M5) is written as a stop-gate too, but has not been
+   confirmed as binding. Default: yes — see `PRD.md` §10.
+
+Also still open, recorded in `docs/` rather than here: when sync actually runs during a task
+(`docs/sync.md` §4 says how, not when), what happens to a dirty guest overlay after a crash
+(`docs/vm.md` §7), and whether the elevated firewall step at install is acceptable
+(`docs/vm.md` §6, matters for M6).

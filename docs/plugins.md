@@ -206,8 +206,10 @@ Deliberately small, and chosen because they cover the loop's needs without a plu
 `fs.patch` before `fs.write` matters: whole-file rewrites are how an expert destroys a file it
 did not read fully.
 
-**Not in scope for M4:** browser tooling, package installation by the agent, network fetch.
-Each is a permission-class conversation, not a manifest edit.
+**Not in scope for M4:** browser tooling, package installation by the agent, network fetch,
+and Claude Code. Each is a permission conversation, not a manifest edit. Claude Code is also an
+agent-inside-a-tool, which is a separate documented exception (`D-013`); to the core it is still
+just a tool, and it must be invoked explicitly rather than selected.
 
 ## 6. Authoring a tool later
 

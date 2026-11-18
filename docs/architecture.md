@@ -20,16 +20,22 @@ bothea core (Rust)
         +-- egress proxy  (127.0.0.1:18080)  <----+     control channel (SSH over
         |     allowlist, key injection, log        |     hostfwd 127.0.0.1:22022)
         |                                          |
-        +-- 9router (127.0.0.1:20128)               +--> bothea-broker
-        |     provider gateway                     |      multiplexes tool calls
+        |    [external, user-run]                   +--> bothea-broker
+        +-- 9router  (127.0.0.1:20128)              |      multiplexes tool calls
+        |     provider keys live in its config      |
         |                                          |
-        +-- llama-server (127.0.0.1:18090)          +--> tool processes
-        |     local GGUF experts                    |      (unprivileged user)
+        |    [external, user-run]                   +--> tool processes
+        +-- llama-server (127.0.0.1:18090)          |      (unprivileged user)
+        |     Bothea only checks /health            |
         |                                          |
-        +-- key store (mode 600)                    +--> git clone of workspace
+        +-- key store (mode 600, Bothea-only)       +--> git clone of workspace
         |                                          |      on branch agent/<run>
         +-- host git repo == lead's working tree ---+      (bundles only, no remote)
 ```
+
+Two of these are **not Bothea's processes** (`D-009`, `D-021`): 9router and llama-server are
+applications the lead runs. Bothea reaches them over HTTP, health-checks them, and records what
+it found. It never spawns, signals, or supervises either one, and it never holds a provider key.
 
 There are exactly **two copies of the workspace**: the host working tree, and the guest
 clone. The rev-2 draft's third copy ("human workspace folder" separate from "host git repo")
@@ -41,15 +47,16 @@ is removed — it is a merge source that adds conflicts and buys nothing (`D-012
 |---|---|---|---|
 | `bothea` core | host | per invocation | everything on the host; guest over one SSH channel |
 | egress proxy | host | per VM session | core (write side), guest (read side), 9router |
-| 9router | host | per VM session | proxy, providers |
-| llama-server | host | on demand, LRU | core |
+| 9router | host | **external, the lead's** | proxy, providers |
+| llama-server | host | **external, the lead's** | Bothea (health + inference calls) |
 | QEMU | host | per VM session | core (child process), proxy, guest |
 | `bothea-broker` | guest | per VM session | core (stdio over SSH), tool processes |
 | tool process | guest | per invocation | broker, proxy (scoped token only) |
 | expert plugin | host | per turn | core |
 
 Every one of these is a separate process. Nothing is linked into the core except the task
-loop and the state machine.
+loop and the state machine. The two external rows are a deliberate boundary: Bothea's
+responsibility ends at "is it answering", not at "is it running" (`D-021`).
 
 ## 3. Trust boundaries
 
@@ -62,10 +69,12 @@ loop and the state machine.
 ```
 
 - The core and the key store are trusted. Everything the core writes (repo, log) is the
-  source of truth.
-- 9router and llama-server are dependencies: they run as the lead's user, hold no
-  Bothea-managed secret beyond what they need, and are treated as compromisable. That is why
-  they sit behind the proxy and behind per-session tokens.
+  source of truth. The key store holds only Bothea's own material — the guest ssh key, the
+  9router client key, per-session tokens. Provider keys are not in it (`D-009`).
+- 9router and llama-server are external applications the lead runs, not components Bothea
+  owns. They hold their own configuration (9router holds the provider keys), they are treated
+  as compromisable, and Bothea only ever talks to them over loopback HTTP and records what it
+  found.
 - The guest is untrusted **by construction**. AI-written code runs there; assume it will try
   to escape. The only contract with the guest is: it may reach the proxy, it may reach
   nothing else, and it holds no secret.
